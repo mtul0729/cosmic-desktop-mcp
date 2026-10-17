@@ -19,6 +19,15 @@ wayland-client = "0.31"
 # pointer-warp. COSMIC implements all three; nothing here needs a private
 # zcosmic_* protocol.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# Optional libei backend. The RemoteDesktop portal hands out an EIS socket,
+# which the compositor treats as a remote-desktop session rather than as a new
+# input device. `reis` is the Rust EI/EIS implementation (same one libei ships).
+# `screencast` is not optional in practice: remote_desktop refers to its
+# Stream type unconditionally, so enabling remote_desktop alone fails to
+# compile (ashpd 0.13.13).
+ashpd = { version = "0.13", features = ["remote_desktop", "screencast"] }
+reis = "0.7"
+tokio = { version = "1", features = ["rt", "time"] }
 
 [profile.release]
 lto = "thin"

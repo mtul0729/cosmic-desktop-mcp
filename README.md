@@ -20,9 +20,11 @@
 
 - **截图** — `ext_image_copy_capture_manager_v1`（staging），不需要对话框
 - **列窗口** — `ext_foreign_toplevel_list_v1`（staging），和 `lswt` 看到的是同一份数据
-- **键鼠** — wayland 协议层没有 `zwp_virtual_pointer_manager_v1`，所以走 `/dev/uinput`
-  （`/dev/uinput` 是目前采用的路径，不是唯一可用的：portal 的 RemoteDesktop v2 暴露了
-  `ConnectToEIS` 和 `NotifyPointerButton`，也能注入输入，但需要授权流程，这里没有采用）
+- **键鼠** — 两条路，默认 uinput：
+  - `/dev/uinput`：无授权流程、无依赖，但绝对坐标按物理像素建，HiDPI 映射要自己扛
+  - **EIS（libei）**：走 portal 的 RemoteDesktop v2，坐标是**逻辑像素**且横跨全部输出，
+    HiDPI 问题不存在；代价是首次要过一次授权框（restore token 可持久化，之后静默）。
+    已实测可用，见下面「EIS 后端」
 
 ## 现状（2026-10-17 实测）
 
@@ -50,13 +52,40 @@
 
 坐标一律是**截图像素的坐标**，截图不缩放，所以不需要换算。
 
+## EIS 后端（实测通过）
+
+`--eis-probe` / `--eis-click X Y` 走 RemoteDesktop portal 拿一个 libei 连接，合成器报上来的设备：
+
+```
+eis: device type=Virtual name=Some("virtual keyboard")
+eis:   interfaces pointer_absolute=false button=false keyboard=true
+eis: device type=Virtual name=Some("virtual absolute pointer")
+eis:   region x=384 y=1152 1280x720  scale=1.5  mapping_id=eDP-1
+eis:   region x=0   y=0    2048x1152 scale=1.25 mapping_id=DP-2
+eis:   interfaces pointer_absolute=true button=true keyboard=false
+```
+
+关键点：
+
+- region 是**逻辑坐标**下完整的桌面拼图（2560x1440 的屏在 scale 1.25 下就是 2048x1152），
+  多屏是一张连续坐标系，`--eis-click 1024 8` 实测正好点在面板时钟上，日历弹窗打开。
+- 授权用 `PersistMode::ExplicitlyRevoked`，restore token 存在
+  `$XDG_STATE_HOME/cosmic-desktop-mcp/restore-token`；之后每次连接**静默通过**，
+  不再弹框。token 能注入输入，别把它提交进任何仓库。
+- 排查时踩过的坑：reis 把请求缓冲在本地，**每个事件循环后必须 `connection.flush()`**，
+  否则 `ei_seat.bind` 根本发不出去，表现为「seat 到了但永远没有 device」。
+- EIS 会话期间合成器会限制真实输入吗？实测不会——点击、截图都正常。
+
+还没有做的事：MCP 工具层（`click` 等）仍走 uinput；把 EIS 做成长驻会话的后端
+（EiEvent 不是 Send，需要独占线程 + 通道）是下一步，收益是丢掉 uinput 依赖和 HiDPI 坐标问题。
+
 ## 已知限制
 
 1. **拿不到窗口状态**。`ext-foreign-toplevel-list` 协议本身不带 focused / minimized / geometry，只有 `wlr-foreign-toplevel-management` 带，而 COSMIC 没实现它。所以 `list_windows` 只能告诉你「有哪些窗口」，不能告诉你「焦点在哪」——那个要靠截图看。
 2. **`type_text` 只支持 ASCII**。uinput 发的是按键，不是字符，中文需要输入法。中文内容请走剪贴板。
 3. **坐标只对主输出（index 0）**。`/dev/uinput` 的绝对坐标范围按主输出尺寸建，多屏时第二块屏的坐标会错。截图本身可以指定 `output`。
-4. **HiDPI 下的坐标映射未验证**。这台机器 `scale=2`，`wl_output` 的 mode 报的是物理像素（1920x1080），uinput 的绝对范围也按物理像素建；compositor 把绝对指针映射到逻辑坐标时是乘还是除 scale，需要实测一次 `click` 才能确认。`scale=1` 的机器没有这个问题。
-4. **`/dev/uinput` 需要写权限**。NixOS 上加一条 udev 规则，或者把用户放进 `uinput` 组。
+4. **HiDPI 下的坐标映射未验证**。这台机器 `scale=2`，`wl_output` 的 mode 报的是物理像素（1920x1080），uinput 的绝对范围也按物理像素建；compositor 把绝对指针映射到逻辑坐标时是乘还是除 scale，需要实测一次 `click` 才能确认。`scale=1` 的机器没有这个问题。EIS 后端没有这个问题。
+5. **`/dev/uinput` 需要写权限**。NixOS 上加一条 udev 规则，或者把用户放进 `uinput` 组。EIS 后端不需要。
 
 ## 安装
 
