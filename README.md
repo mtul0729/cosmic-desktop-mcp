@@ -66,6 +66,12 @@
 
 坐标一律是**截图像素的坐标**，截图不缩放，所以不需要换算。
 
+给 agent 用的**工作流**（先 `env_info`、`activate` 再打字、不要 `kill` applet 之类的
+顺序与禁忌）不在工具描述里，而是单独一个配套 skill：`cosmic-desktop-ops`
+（[`mtul0729/agent-skills`](https://github.com/mtul0729/agent-skills)）。工具 schema
+只管"这次调用做什么"，而每次 `tools/list` 都要为它付费；判断该调哪个、会踩什么坑属于
+按需加载的知识，塞进 schema 是净亏。
+
 ## COSMIC 专用操作
 
 操纵桌面只是用途之一；调试 COSMIC 自己的应用、widgets 和 applets 是另一条主线。
