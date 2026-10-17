@@ -78,10 +78,14 @@ nothing to convert.
 
 The **workflow** an agent needs (run `env_info` first, `activate` before typing, never
 `kill` an applet — the ordering rules and the traps) is deliberately not in the tool
-descriptions. It lives in a companion skill, `cosmic-desktop-ops`
-([`mtul0729/agent-skills`](https://github.com/mtul0729/agent-skills)). A tool schema only
-says what one call does, and every `tools/list` pays for that text; knowing which call
-comes next and what will bite you is knowledge worth loading on demand only.
+descriptions. It ships in this repository as an agent skill,
+[`skill/cosmic-desktop-ops`](skill/cosmic-desktop-ops/SKILL.md). A tool schema only says
+what one call does, and every `tools/list` pays for that text; knowing which call comes
+next and what will bite you is knowledge worth loading on demand only.
+
+The skill lives here rather than in a skills collection because it is the manual for *this*
+API: rename a tool or fix a quirk and it must change in the same commit. Install it through
+Magpie with source `mtul0729/cosmic-desktop-mcp`, path `skill/cosmic-desktop-ops`.
 
 ## COSMIC-specific operations
 
@@ -378,6 +382,11 @@ nix develop          # cargo / rustc / rustfmt / clippy
 cargo check
 cargo build
 ```
+
+`skill/cosmic-desktop-ops/SKILL.md` is part of the deliverable, not commentary: a renamed
+tool, a changed argument, or a newly discovered trap means editing it in the same commit.
+`cleanCargoSource` drops it from the Rust build source, which is intended — it is
+documentation, not compilation input.
 
 Packaging details are in [NIX.md](NIX.md).
 
