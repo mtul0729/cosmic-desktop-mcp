@@ -292,23 +292,6 @@ impl Device {
         ])
     }
 
-    /// Types printable ASCII. Anything else needs an input method, which a
-    /// uinput device cannot drive — CJK goes through the clipboard instead.
-    pub fn type_text(&self, text: &str) -> Result<()> {
-        for ch in text.chars() {
-            let (code, shift) = keycode_for(ch)
-                .with_context(|| format!("character {ch:?} needs an input method"))?;
-            if shift {
-                self.key(KEY_LEFTSHIFT, true)?;
-            }
-            self.key(code, true)?;
-            self.key(code, false)?;
-            if shift {
-                self.key(KEY_LEFTSHIFT, false)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Drop for Device {
@@ -344,7 +327,7 @@ impl Button {
         }
     }
 
-    fn code(self) -> u16 {
+    pub fn code(self) -> u16 {
         match self {
             Self::Left => BTN_LEFT,
             Self::Right => BTN_RIGHT,
@@ -353,11 +336,11 @@ impl Button {
     }
 }
 
-const KEY_LEFTSHIFT: u16 = 42;
+pub const KEY_LEFTSHIFT: u16 = 42;
 
 /// US layout only: the compositor's layout is irrelevant here because the
 /// events go in below it.
-fn keycode_for(ch: char) -> Option<(u16, bool)> {
+pub fn keycode_for(ch: char) -> Option<(u16, bool)> {
     let (code, shift) = match ch {
         'a'..='z' => (letter(ch)?, false),
         'A'..='Z' => (letter(ch.to_ascii_lowercase())?, true),

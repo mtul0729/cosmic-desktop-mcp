@@ -7,19 +7,17 @@
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::clipboard;
-use crate::uinput::{Button, Device, parse_chord};
+use crate::input;
+use crate::uinput::Button;
 use crate::wl::{capture, toplevel};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
-
-static DEVICE: OnceLock<Mutex<Device>> = OnceLock::new();
 
 pub fn serve() -> Result<()> {
     let stdin = std::io::stdin();
@@ -125,7 +123,11 @@ first, waits for the compositor to register the hover, then presses and releases
                         "type": "integer",
                         "enum": [1, 2],
                         "description": "1 = single click, 2 = double click. Default 1."
-                    }
+                    },
+                    "output": {
+                        "type": "integer",
+                        "description": "Output index from screenshot (default 0). Coordinates are in that output's pixel space."
+                    },
                 },
                 "required": ["x", "y"]
             }
@@ -137,21 +139,31 @@ first, waits for the compositor to register the hover, then presses and releases
                 "type": "object",
                 "properties": {
                     "x": {"type": "integer"},
-                    "y": {"type": "integer"}
+                    "y": {"type": "integer"},
+                    "output": {
+                        "type": "integer",
+                        "description": "Output index from screenshot (default 0). Coordinates are in that output's pixel space."
+                    },
                 },
                 "required": ["x", "y"]
             }
         },
         {
             "name": "scroll",
-            "description": "Scroll the wheel at a point. Positive dy scrolls down, positive dx scrolls right.",
+            "description": "Scroll the wheel at a point. Positive dy scrolls UP (reveals earlier \
+content, matching the kernel REL_WHEEL convention), negative dy scrolls down; positive dx \
+scrolls right.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "x": {"type": "integer"},
                     "y": {"type": "integer"},
                     "dy": {"type": "integer", "description": "Wheel clicks, vertical."},
-                    "dx": {"type": "integer", "description": "Wheel clicks, horizontal."}
+                    "dx": {"type": "integer", "description": "Wheel clicks, horizontal."},
+                    "output": {
+                        "type": "integer",
+                        "description": "Output index from screenshot (default 0). Coordinates are in that output's pixel space."
+                    },
                 },
                 "required": ["x", "y"]
             }
@@ -277,30 +289,20 @@ fn tool_click(args: &Value) -> Result<String> {
         None => Button::Left,
     };
     let count = args.get("count").and_then(Value::as_u64).unwrap_or(1).max(1);
+    let output = output_arg(args);
 
-    let device = device()?;
-    device.move_to(x, y)?;
-    // A press that lands during the move is treated as the end of a drag; the
-    // compositor needs to see a settled hover first.
-    std::thread::sleep(Duration::from_millis(250));
-
-    for round in 0..count {
-        if round > 0 {
-            std::thread::sleep(Duration::from_millis(60));
-        }
-        device.button(button, true)?;
-        std::thread::sleep(Duration::from_millis(90));
-        device.button(button, false)?;
-    }
-
-    Ok(format!("clicked {button:?} at ({x}, {y}) x{count}"))
+    input::click(button, x, y, output, count as u32)?;
+    Ok(format!(
+        "clicked {button:?} at ({x}, {y}) on output {output} x{count}"
+    ))
 }
 
 fn tool_move(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    device()?.move_to(x, y)?;
-    Ok(format!("pointer at ({x}, {y})"))
+    let output = output_arg(args);
+    input::move_to(x, y, output)?;
+    Ok(format!("pointer at ({x}, {y}) on output {output}"))
 }
 
 fn tool_scroll(args: &Value) -> Result<String> {
@@ -309,11 +311,9 @@ fn tool_scroll(args: &Value) -> Result<String> {
     let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
     let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
 
-    let device = device()?;
-    device.move_to(x, y)?;
-    std::thread::sleep(Duration::from_millis(150));
-    device.scroll(dy, dx)?;
-    Ok(format!("scrolled dx={dx} dy={dy} at ({x}, {y})"))
+    let output = output_arg(args);
+    input::scroll(x, y, output, dx, dy)?;
+    Ok(format!("scrolled dx={dx} dy={dy} at ({x}, {y}) on output {output}"))
 }
 
 fn tool_type_text(args: &Value) -> Result<String> {
@@ -340,7 +340,7 @@ fn tool_type_text(args: &Value) -> Result<String> {
             if !keyable {
                 bail!("mode=keys only accepts printable ASCII; use mode=paste for anything else");
             }
-            device()?.type_text(text)?;
+            input::type_keys(text)?;
             Ok(format!(
                 "typed {} characters as keycodes",
                 text.chars().count()
@@ -384,15 +384,11 @@ fn tool_key(args: &Value) -> Result<String> {
 }
 
 fn press_chord(combo: &str) -> Result<()> {
-    let codes = parse_chord(combo)?;
-    let device = device()?;
-    for code in &codes {
-        device.key(*code, true)?;
-    }
-    for code in codes.iter().rev() {
-        device.key(*code, false)?;
-    }
-    Ok(())
+    input::chord(combo)
+}
+
+fn output_arg(args: &Value) -> usize {
+    args.get("output").and_then(Value::as_u64).unwrap_or(0) as usize
 }
 
 fn int_arg(args: &Value, key: &str) -> Result<i32> {
@@ -401,20 +397,6 @@ fn int_arg(args: &Value, key: &str) -> Result<i32> {
         .and_then(Value::as_i64)
         .with_context(|| format!("missing integer argument {key:?}"))?;
     i32::try_from(value).with_context(|| format!("argument {key:?} out of range"))
-}
-
-fn device() -> Result<std::sync::MutexGuard<'static, Device>> {
-    if DEVICE.get().is_none() {
-        let outputs = capture::outputs().context("probe outputs for pointer range")?;
-        let main = outputs.first().context("no output to map coordinates to")?;
-        let opened = Device::open("cosmic-desktop-mcp", main.width, main.height)?;
-        let _ = DEVICE.set(Mutex::new(opened));
-    }
-    DEVICE
-        .get()
-        .context("device init raced")?
-        .lock()
-        .map_err(|err| anyhow::anyhow!("uinput device lock poisoned: {err}"))
 }
 
 fn runtime_dir() -> PathBuf {
@@ -451,9 +433,6 @@ pub fn doctor() -> Result<()> {
             Err(err) => println!("capture #{index}: {err:#}"),
         }
     }
-    let main = outputs.first().context("no output")?;
-    let device = Device::open("cosmic-desktop-mcp", main.width, main.height)
-        .context("open /dev/uinput")?;
-    println!("uinput: ok ({}x{})", device.size().0, device.size().1);
+    print!("{}", input::describe().context("probe the input backend")?);
     Ok(())
 }
