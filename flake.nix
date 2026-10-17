@@ -43,10 +43,12 @@
           ];
         };
 
-        # Vendoring only reads Cargo.toml/Cargo.lock, so source edits never
-        # re-vendor.
+        # Vendoring needs nothing but the lockfile: crane readFile()s
+        # `cargoLock` at eval time and never walks the source tree, so editing
+        # src/ cannot invalidate this derivation. Handing it `src` instead would
+        # only make it hunt for .cargo/config, which this repo does not have.
         cargoVendorDir = craneLib.vendorCargoDeps {
-          src = craneLib.cleanCargoSource ./.;
+          cargoLock = ./Cargo.lock;
         };
 
         package = craneLib.buildPackage {
