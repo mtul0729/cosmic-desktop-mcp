@@ -1,75 +1,37 @@
-//! Input dispatch.
+//! Input over EIS (libei).
 //!
-//! Two backends exist because they trade differently:
+//! There is one backend, and it goes through the RemoteDesktop portal: no
+//! device permissions, logical coordinates from the compositor, works across
+//! outputs with mixed scale factors. The cost is one authorization dialog per
+//! machine (remembered afterwards) and one behavioural quirk — **a click does
+//! not move keyboard focus on COSMIC**, so `click` followed by `type_text`
+//! only lands where focus already was.
 //!
-//! - **eis** (default) — libei through the RemoteDesktop portal. No device
-//!   permission needed, logical coordinates from the compositor, works on all
-//!   outputs including mixed scale factors. Costs one authorization dialog per
-//!   machine (remembered), and **a click does not move keyboard focus** on
-//!   COSMIC, so `click` followed by `type_text` only lands where focus already is.
-//! - **uinput** — a synthetic kernel device. Needs write access to
-//!   `/dev/uinput`, transfers focus like a real mouse, but its absolute range is
-//!   built from one output's physical pixels and it cannot express a second
-//!   screen correctly.
-//!
-//! `COSMIC_DESKTOP_INPUT=uinput` switches; anything else defaults to eis.
+//! Coordinates entering this module are pixels of a screenshot; EIS speaks
+//! logical desktop coordinates, and `logical()` converts between them.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 
 use crate::eis;
-use crate::uinput::{self, Button, Device};
+use crate::keymap::{self, Button};
 use crate::wl::capture;
 
-static UINPUT: OnceLock<Mutex<Device>> = OnceLock::new();
 static OUTPUTS: OnceLock<Vec<capture::OutputInfo>> = OnceLock::new();
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Eis,
-    Uinput,
-}
-
-fn mode() -> Result<Mode> {
-    match std::env::var("COSMIC_DESKTOP_INPUT").ok().as_deref() {
-        None | Some("") | Some("eis") => Ok(Mode::Eis),
-        Some("uinput") => Ok(Mode::Uinput),
-        Some(other) => bail!(
-            "unknown COSMIC_DESKTOP_INPUT={other:?}; expected \"eis\" or \"uinput\""
-        ),
-    }
-}
-
 pub fn describe() -> Result<String> {
-    let mode = mode()?;
-    let mut out = match mode {
-        Mode::Eis => "backend: eis (libei through the RemoteDesktop portal)\n".to_string(),
-        Mode::Uinput => "backend: uinput (/dev/uinput synthetic device)\n".to_string(),
-    };
-    match mode {
-        Mode::Eis => out.push_str(&eis::session()?.describe()),
-        Mode::Uinput => {
-            let device = uinput_device()?;
-            out.push_str(&format!("uinput device: {}x{}\n", device.size().0, device.size().1));
-        }
-    }
-    Ok(out)
+    Ok(format!(
+        "backend: eis (libei through the RemoteDesktop portal)\n{}",
+        eis::session()?.describe()
+    ))
 }
 
 /// Moves the pointer. `x`/`y` are pixels in the screenshot of `output`.
 pub fn move_to(x: i32, y: i32, output: usize) -> Result<()> {
-    match mode()? {
-        Mode::Eis => {
-            let (lx, ly) = logical(x, y, output)?;
-            eis::session()?.move_to(lx, ly)
-        }
-        Mode::Uinput => {
-            single_output(output)?;
-            uinput_device()?.move_to(x, y)
-        }
-    }
+    let (lx, ly) = logical(x, y, output)?;
+    eis::session()?.move_to(lx, ly)
 }
 
 pub fn click(button: Button, x: i32, y: i32, output: usize, count: u32) -> Result<()> {
@@ -93,28 +55,20 @@ pub fn scroll(x: i32, y: i32, output: usize, dx: i32, dy: i32) -> Result<()> {
     move_to(x, y, output)?;
     std::thread::sleep(Duration::from_millis(150));
 
-    match mode()? {
-        Mode::Eis => {
-            // EIS scroll axes follow the touchpad convention: positive y is
-            // down, while the tool's dy is in wheel clicks with positive = up
-            // (the uinput REL_WHEEL convention).
-            eis::session()?.scroll_clicks(dx, -dy)
-        }
-        Mode::Uinput => uinput_device()?.scroll(dy, dx),
-    }
+    // EIS scroll axes follow the touchpad convention: positive y is down, while
+    // the tool's dy is in wheel clicks with positive = up (the kernel REL_WHEEL
+    // convention). Hence the negation.
+    eis::session()?.scroll_clicks(dx, -dy)
 }
 
 pub fn key(code: u16, pressed: bool) -> Result<()> {
-    match mode()? {
-        Mode::Eis => eis::session()?.key(u32::from(code), pressed),
-        Mode::Uinput => uinput_device()?.key(code, pressed),
-    }
+    eis::session()?.key(u32::from(code), pressed)
 }
 
 /// Presses a `ctrl+s` style chord: modifiers in the given order, released in
 /// reverse.
 pub fn chord(combo: &str) -> Result<()> {
-    let codes = uinput::parse_chord(combo)?;
+    let codes = keymap::parse_chord(combo)?;
     for code in &codes {
         key(*code, true)?;
     }
@@ -129,34 +83,21 @@ pub fn chord(combo: &str) -> Result<()> {
 pub fn type_keys(text: &str) -> Result<()> {
     for ch in text.chars() {
         let (code, shift) =
-            uinput::keycode_for(ch).with_context(|| format!("character {ch:?} needs an input method"))?;
+            keymap::keycode_for(ch).with_context(|| format!("character {ch:?} needs an input method"))?;
         if shift {
-            key(uinput::KEY_LEFTSHIFT, true)?;
+            key(keymap::KEY_LEFTSHIFT, true)?;
         }
         key(code, true)?;
         key(code, false)?;
         if shift {
-            key(uinput::KEY_LEFTSHIFT, false)?;
+            key(keymap::KEY_LEFTSHIFT, false)?;
         }
     }
     Ok(())
 }
 
 fn set_button(button: Button, pressed: bool) -> Result<()> {
-    match mode()? {
-        Mode::Eis => eis::session()?.button(u32::from(button.code()), pressed),
-        Mode::Uinput => uinput_device()?.button(button, pressed),
-    }
-}
-
-fn single_output(output: usize) -> Result<()> {
-    if output != 0 {
-        bail!(
-            "the uinput backend only addresses output 0; set COSMIC_DESKTOP_INPUT=eis for \
-             multi-monitor coordinates"
-        );
-    }
-    Ok(())
+    eis::session()?.button(u32::from(button.code()), pressed)
 }
 
 /// Maps a screenshot pixel of `output` to a logical desktop coordinate.
@@ -192,19 +133,4 @@ fn outputs() -> Result<&'static [capture::OutputInfo]> {
         let _ = OUTPUTS.set(list);
     }
     Ok(OUTPUTS.get().map(Vec::as_slice).unwrap_or(&[]))
-}
-
-fn uinput_device() -> Result<MutexGuard<'static, Device>> {
-    if UINPUT.get().is_none() {
-        let main = outputs()?
-            .first()
-            .context("no output to map coordinates to")?;
-        let device = Device::open("cosmic-desktop-mcp", main.width, main.height)?;
-        let _ = UINPUT.set(Mutex::new(device));
-    }
-    UINPUT
-        .get()
-        .context("uinput device init raced")?
-        .lock()
-        .map_err(|err| anyhow::anyhow!("uinput device lock poisoned: {err}"))
 }

@@ -1,10 +1,13 @@
 //! Input backend: libei, obtained through the XDG RemoteDesktop portal.
 //!
-//! Why this exists alongside `uinput`:
+//! Why it is done this way:
 //!
-//! - No `/dev/uinput`, no udev rule, no extra input device in the session.
-//!   COSMIC sees a remote-desktop session, the same thing a VNC or RDP client
-//!   would open, and it can be revoked from the portal.
+//! - COSMIC has no `zwp_virtual_pointer_manager_v1`, so pointer buttons and the
+//!   wheel cannot be injected with a Wayland protocol. EIS is the compositor's
+//!   own input-injection path, and it needs no `/dev/uinput`, no udev rule and
+//!   no extra input device in the session. COSMIC sees a remote-desktop
+//!   session — the same thing a VNC or RDP client would open — and it can be
+//!   revoked from the portal.
 //! - Coordinates are logical pixels, straight from the device region, so
 //!   multi-monitor and fractional scaling work without any guesswork.
 //!
@@ -34,7 +37,7 @@ use ashpd::desktop::{CreateSessionOptions, PersistMode};
 use reis::ei;
 use reis::event::{Connection, DeviceCapability, EiEvent};
 
-/// Linux input-event codes; the same numbering `uinput` uses.
+/// Linux input-event codes; the same numbering the kernel uses.
 pub const BTN_LEFT: u32 = 0x110;
 
 /// Opening the session can need a person to click "allow", so the first call

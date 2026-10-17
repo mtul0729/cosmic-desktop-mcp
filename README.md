@@ -20,18 +20,18 @@
 
 - **截图** — `ext_image_copy_capture_manager_v1`（staging），不需要对话框
 - **列窗口** — `ext_foreign_toplevel_list_v1`（staging），和 `lswt` 看到的是同一份数据
-- **键鼠** — 两条路，默认 uinput：
-  - `/dev/uinput`：无授权流程、无依赖，但绝对坐标按物理像素建，HiDPI 映射要自己扛
-  - **EIS（libei）**：走 portal 的 RemoteDesktop v2，坐标是**逻辑像素**且横跨全部输出，
-    HiDPI 问题不存在；代价是首次要过一次授权框（restore token 可持久化，之后静默）。
-    已实测可用，见下面「EIS 后端」
+- **键鼠** — 走 EIS（libei），经 portal 的 RemoteDesktop v2 授权：
+  坐标是**逻辑像素**且横跨全部输出，HiDPI 不成问题；代价是首次要过一次授权框
+  （restore token 可持久化，之后静默）。见下面「EIS 后端」。
+  早期版本用 `/dev/uinput` 合成内核设备，要设备权限、绝对坐标只按单输出物理像素建、
+  多屏和混合缩放都会错——2026-10-17 已整个删掉，不再有回退开关。
 
 ## 现状（2026-10-17 实测）
 
 | 能力 | 状态 |
 |---|---|
 | `list_windows` | ✅ 通，输出和 `lswt -j` 一致 |
-| 键鼠（`click` / `move` / `scroll` / `type_text` / `key`） | ✅ 默认走 EIS（libei），`/dev/uinput` 可回退 |
+| 键鼠（`click` / `move` / `scroll` / `type_text` / `key`） | ✅ 走 EIS（libei），不需要 `/dev/uinput` |
 | 滚轮方向 | ✅ 实测：dy 正数向上、负数向下（REL_WHEEL 惯例） |
 | `screenshot` | ✅ 通，颜色/方向正确 |
 
@@ -45,11 +45,11 @@
 |---|---|---|
 | `screenshot` | 截一个输出，存 PNG，返回路径 | ext-image-copy-capture + wl_shm |
 | `list_windows` | 列出窗口的 identifier / title / app_id | ext-foreign-toplevel-list |
-| `click` | 按截图坐标点击（先移动、等悬停、再按下） | EIS / uinput |
-| `move` | 移动指针悬停 | EIS / uinput |
-| `scroll` | 滚轮，`dy` 正数向上、负数向下 | EIS / uinput |
+| `click` | 按截图坐标点击（先移动、等悬停、再按下） | EIS |
+| `move` | 移动指针悬停 | EIS |
+| `scroll` | 滚轮，`dy` 正数向上、负数向下 | EIS |
 | `type_text` | **一律走剪贴板 + ctrl+v**（默认）；`mode:"keys"` 才发 keycode | wl-clipboard + EIS |
-| `key` | 按组合键，如 `ctrl+s` | EIS / uinput |
+| `key` | 按组合键，如 `ctrl+s` | EIS |
 | `clipboard_write` | 写剪贴板（不粘贴） | wl-copy（来自 wl-clipboard） |
 | `clipboard_read` | 读剪贴板 | wl-paste |
 
@@ -91,8 +91,8 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
   面板时钟那种目标不可靠——它可能压根不响应滚轮。
 
 MCP 工具层在 2026-10-17 已切到 EIS：`src/input.rs` 做后端分发，默认 EIS，
-`COSMIC_DESKTOP_INPUT=uinput` 可回退。EIS 会话常驻（`EiEvent` 不是 `Send`，独占一个线程
-+ 通道注入命令），所以 `/dev/uinput` 不再是必需依赖，也没有 HiDPI 坐标换算问题。
+EIS 会话常驻（`EiEvent` 不是 `Send`，独占一个线程 + 通道注入命令），
+键位表在 `src/keymap.rs`，`/dev/uinput` 已彻底移除。
 
 ## 已知限制
 
@@ -104,9 +104,10 @@ MCP 工具层在 2026-10-17 已切到 EIS：`src/input.rs` 做后端分发，默
    已实测：`clipboard_write` 中文读回一致，且同时提供 XWayland 兼容的
    `TEXT`/`STRING`/`UTF8_STRING` 类型，Chrome/Electron 应用可粘贴。
    一个特性：Wayland 选区跟着持有进程走，MCP server 退出后剪贴板内容就没了。
-3. **uinput 后端的坐标只对主输出（index 0）**。绝对坐标范围按主输出尺寸建，多屏时第二块屏的坐标会错。EIS 后端用 region 拼图换算，没有这个问题；截图本身也可以指定 `output`。
-4. **uinput 后端在 HiDPI 下要自己扛映射**。`wl_output` 的 mode 报物理像素，uinput 的绝对范围也按物理像素建，compositor 换算方向得实测。EIS 后端全程逻辑坐标，不存在这个问题（本机 DP-2 scale 1.25 / eDP-1 scale 1.5 已实测）。
-5. **只有回退到 uinput 才需要 `/dev/uinput` 写权限**。NixOS 上加一条 udev 规则，或者把用户放进 `uinput` 组。默认的 EIS 后端不需要。
+3. **点击不转移键盘焦点**。`click` 之后 `type_text` 去的仍是点击**之前**的焦点窗口，
+   不是刚点过的那个。要往某个窗口输入，先让用户或窗口管理器把焦点给它。
+4. **`key` 的键位表是 US 布局**。事件进合成器的输入管线，由它套布局，而布局问不到；
+   非 US 布局请走剪贴板。
 
 ## 安装
 
@@ -153,15 +154,21 @@ cosmic-desktop-mcp --doctor
 wayland: Ok("wayland-1")
 output #0: 1920x1080 scale=2
 output #1: 2560x1440 scale=2
-toplevels: 4
+toplevels: 2
   WorkBuddy [yKlXztLTFkE6KoyiT4A5RQgQ9OxjLidx] WorkBuddy
-  google-chrome [bDnZaXHkKVBXExpsn0VF15TVqL9BPpON] Build sticky-notes - Google Chrome
-  kitty [62RB3VJhOwe73CtJINYPQ6RbMUyyy2od] hx .github/workflows ~/S/p/sticky-notes
-  org.b3log.siyuan [CpFiIdqTYDPeKlAFr5a028BXqgenCFzi] 20260919134006 - SiYuan - 思源笔记 v3.8.7
+  kitty [yMeUdgSO2ua7TSqYvAllKYApFGasyKEg] hx ~/S/p/cosmic-desktop-mcp
 capture #0: 1920x1080 ok (8294400 bytes rgba)
 capture #1: 2560x1440 ok (14745600 bytes rgba)
-uinput: ok (1920x1080)
+backend: eis (libei through the RemoteDesktop portal)
+device "virtual keyboard" serial=2 absolute=false button=false keyboard=true pointer=false scroll=false
+device "virtual pointer" serial=3 absolute=false button=true keyboard=false pointer=true scroll=true
+device "virtual absolute pointer" serial=4 absolute=true button=true keyboard=false pointer=false scroll=true
+region Some("eDP-1") logical x=384 y=1152 1280x720 scale=1.5 -> physical 1920x1080
+region Some("DP-2") logical x=0 y=0 2048x1152 scale=1.25 -> physical 2560x1440
 ```
+
+最后那段 `backend:` 及其后是输入后端自述：会列出合成器给的三类虚拟设备
+（键盘 / 相对指针 / 绝对指针）和每个输出的 region，region 就是坐标换算的依据。
 
 ## 开发
 
@@ -177,7 +184,8 @@ cargo build
 
 - `ext-image-copy-capture` — https://wayland.app/protocols/ext-image-copy-capture-v1
 - `ext-foreign-toplevel-list` — https://wayland.app/protocols/ext-foreign-toplevel-list-v1
-- `linux/uinput.h` — ioctl 号是稳定 ABI，所以这里手写而不是引 bindings crate
+- `ei` (libei) — https://libei.readthedocs.io/
+- `input-event-codes` — 键位/按钮码表，`src/keymap.rs` 里手写，只覆盖用得到的部分
 
 ## License
 

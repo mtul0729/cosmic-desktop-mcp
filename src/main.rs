@@ -1,15 +1,16 @@
 //! MCP server for driving a COSMIC/Wayland desktop.
 //!
-//! Three layers, each using the protocol COSMIC actually implements:
+//! Four layers, each using the protocol COSMIC actually implements:
 //!   - `wl::capture`     ext_image_copy_capture_v1 + wl_shm
 //!   - `wl::toplevel`    ext_foreign_toplevel_list_v1
-//!   - `input`           EIS/libei by default, /dev/uinput on request
+//!   - `input`           EIS/libei through the RemoteDesktop portal
+//!   - `keymap`          linux key/button codes (US layout)
 
 mod clipboard;
 mod eis;
 mod input;
+mod keymap;
 mod mcp;
-mod uinput;
 mod wl;
 
 use std::process::ExitCode;
@@ -65,8 +66,6 @@ fn run() -> Result<()> {
                  \x20 cosmic-desktop-mcp --eis-probe  open a RemoteDesktop portal session and dump EIS devices\n\
                  \x20 cosmic-desktop-mcp --eis-click X Y  left-click a logical desktop coordinate over EIS\n\
                  \n\
-                 Environment:\n\
-                 \x20 COSMIC_DESKTOP_INPUT=eis|uinput   input backend, default eis\n\
                  \x20 cosmic-desktop-mcp --version  print version\n",
                 env!("CARGO_PKG_VERSION")
             );

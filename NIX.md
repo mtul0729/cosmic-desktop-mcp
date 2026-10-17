@@ -56,16 +56,13 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc -c cargo check
 
 ## 踩过的坑
 
-1. **`UI_DEV_CREATE` 是 `_IO` 不是 `_IOW`**。`linux/uinput.h` 里
-   `UI_DEV_CREATE _IO(UINPUT_IOCTL_BASE, 1)` 没有方向位也没有 size；按 `_IOW(nr, 0)` 编出来
-   是 `0x40005501`，内核直接回 `EINVAL`。正确的是 `0x5501`。
-2. **`ext_foreign_toplevel_list_v1` 的 `toplevel` 事件会创建新对象**，`wayland-client` 要求
+1. **`ext_foreign_toplevel_list_v1` 的 `toplevel` 事件会创建新对象**，`wayland-client` 要求
    显式实现 `Dispatch::event_created_child`，否则运行到那一步直接 panic
    （"Missing event_created_child specialization"）。用 `event_created_child!` 宏补。
-3. **COSMIC 的 shm format 是 ABGR8888 / XBGR8888**（`0x34324241` / `0x34324258`），
+2. **COSMIC 的 shm format 是 ABGR8888 / XBGR8888**（`0x34324241` / `0x34324258`），
    不是常见的 ARGB/XRGB。内存字节序是 R,G,B,A，正好可以直接拷进 `RgbaImage`，不用交换。
-4. **crane 的 `src` 里不能有 `target/`**，否则每次构建哈希都变。`fileset.toSource` 的白名单
+3. **crane 的 `src` 里不能有 `target/`**，否则每次构建哈希都变。`fileset.toSource` 的白名单
    已经规避了这一点。
-5. **锁屏时 capture 会静默挂起**。cosmic-greeter 挂着时 `create_session` 一切正常，
+4. **锁屏时 capture 会静默挂起**。cosmic-greeter 挂着时 `create_session` 一切正常，
    `capture()` 永远不回事件，只能靠 5 秒超时兜底。排查时差点当成 cosmic-comp 的 shm
    路径没实现——其实是屏幕锁着。

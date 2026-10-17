@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::clipboard;
 use crate::input;
-use crate::uinput::Button;
+use crate::keymap::Button;
 use crate::wl::{capture, toplevel};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
