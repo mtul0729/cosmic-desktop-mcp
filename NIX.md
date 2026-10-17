@@ -1,86 +1,102 @@
-# Nix 打包说明
+# Packaging notes
 
-Rust 项目，crane 打包。结构照 `sticky-notes`，但更简单：**没有 git 依赖**，所以不需要
-`outputHashes` 表，也没有 `update-hashes` 这个 app。
+A Rust project, packaged with crane. The layout follows `sticky-notes` but is simpler:
+**no git dependencies**, so there is no `outputHashes` table and no `update-hashes` app.
 
-## 构建
+## Building
 
 ```bash
 nix build
 ```
 
-产物：`result/bin/cosmic-desktop-mcp`。没有系统库依赖——`wayland-client` 走运行时
-dlopen，不需要 `pkg-config` 也不需要 `libwayland` 进 buildInputs。
+The result is `result/bin/cosmic-desktop-mcp`. There are no system library dependencies —
+`wayland-client` dlopens at runtime, so neither `pkg-config` nor `libwayland` needs to be in
+`buildInputs`.
 
-三段式缓存（crane 默认行为）：
+Three-stage caching (crane's default):
 
-- **vendor 目录**（`cargoVendorDir`）：只传 `cargoLock = ./Cargo.lock`。crane 在 **eval 阶段**
-  用 `readFile` 读锁文件，从不遍历源码树（见「踩过的坑」第 4 条），所以改源码不会重算 vendor。
-- **依赖编译**（`cargoArtifacts`）：`buildPackage` 先跑 `buildDepsOnly`，把
-  wayland-client / image / serde 这些编成一个 `target.tar.zst` 单独进 store。目前 49 个
-  crate，产物比 sticky-notes 的 830 MiB 小两个数量级。
-- **主 crate**：只有 `src/` 变了才重编。
+- **Vendor directory** (`cargoVendorDir`): only `cargoLock = ./Cargo.lock` is passed. crane
+  `readFile`s the lock at **evaluation time** and never walks the source tree (pitfall 4
+  below), so changing sources does not recompute the vendor derivation.
+- **Dependency build** (`cargoArtifacts`): `buildPackage` runs `buildDepsOnly` first,
+  compiling wayland-client / image / serde and friends into a single `target.tar.zst` in the
+  store. That is 99 crates today; the artifact is two orders of magnitude smaller than
+  sticky-notes' 830 MiB.
+- **The main crate**: rebuilt only when `src/` changes.
 
-`src` 用 `craneLib.cleanCargoSource ./.`：保留全部 `*.rs`（含 `build.rs`）、`*.toml`
-（含 `.cargo/config.toml`）和目录骨架，剔掉 `.jj`、`.git`、`target` 和非 rs/toml 文件
-（文档、图片）。本地和 CI 的 drv 哈希因此一致，cachix 能命中。
+`src` uses `craneLib.cleanCargoSource ./.`: it keeps every `*.rs` (including `build.rs`),
+every `*.toml` (including `.cargo/config.toml`) and the directory skeleton, and drops
+`.jj`, `.git`, `target` and non-rs/toml files (docs, images). Local and CI derivations
+therefore hash identically, so cachix hits.
 
-**不要改回手工白名单。** 曾经写的是
-`fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ]`，看着更精确，实际是个陷阱：漏掉
-`build.rs` 时 cargo 不会报错，它的语义是「这个 crate 没有构建脚本」，于是沙箱里编出来的
-二进制和 devShell 里 `cargo build` 的产物**不是同一个东西，且没有任何告警**；
-`.cargo/config.toml` 丢掉的 rustflags 同理。白名单漏掉 `include_bytes!` 的图片会编译失败，
-那是好事。**宁可大声失败，不要安静地编错。**
+**Do not switch back to a hand-written whitelist.** The earlier
+`fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ]` looked more precise and was a trap:
+when `build.rs` is missing cargo does not complain — its semantics are "this crate has no
+build script" — so the sandbox binary and the devShell `cargo build` output are **not the
+same artifact, with no warning at all**. `.cargo/config.toml` loses its rustflags the same
+way. A whitelist that misses an `include_bytes!` image fails loudly, which is the good
+outcome. **Fail loudly rather than build the wrong thing quietly.**
 
-`rust-toolchain.toml` 现在会进 store：crane 的过滤器保留所有 `*.toml`。无害——只有 rustup
-读这个文件，而 nix 的 `cargo` 是真实二进制不是 rustup shim（实测：把 channel 写成不存在的
-版本，`cargo metadata` 照样跑）。
+`rust-toolchain.toml` does end up in the store now: crane's filter keeps every `*.toml`.
+That is harmless — only rustup reads the file, and nix's `cargo` is a real binary, not a
+rustup shim (verified: point the channel at a nonexistent version and `cargo metadata`
+still runs).
 
 ## CI
 
-沿用 `helix-flake` / `sticky-notes` 的结构，两个 workflow 共用一个 `setup` 复合 action：
+Follows the `helix-flake` / `sticky-notes` structure, with both workflows sharing one
+`setup` composite action:
 
-- **`setup`**：`install-nix-action@v31`（带 `access-tokens` 防限流）+ `cachix-action@v17`
-  （cache `mtul`，`CACHIX_AUTH_TOKEN` 没配就跳过 push）
-- **`build.yml`**：push 到 main / PR / 手动 → `nix flake check --all-systems` + `nix build -L`。
-  构建即发布：setup 里的 cachix 把每个构建产物推进 `mtul`，本地 `nix build` 直接 substitute。
-- **`update-inputs.yml`**：每天 04:00 UTC 跑 `nix flake update`，构建通过才把 `flake.lock`
-  提交回 main。构建是闸门，坏的 input 到不了主干。
+- **`setup`**: `install-nix-action@v31` (with `access-tokens` against rate limits) +
+  `cachix-action@v17` (cache `mtul`; pushes are skipped when `CACHIX_AUTH_TOKEN` is unset)
+- **`build.yml`**: push to main / PR / manual → `nix flake check --all-systems` +
+  `nix build -L`. Building is publishing: the cachix step in `setup` pushes every result to
+  `mtul`, so a local `nix build` substitutes directly.
+- **`update-inputs.yml`**: runs `nix flake update` daily at 04:00 UTC and commits
+  `flake.lock` back to main only if the build passes. The build is the gate; a broken input
+  never reaches the branch.
 
-`--all-systems` 是因为 flake 同时覆盖 `x86_64-linux` / `aarch64-linux`，不加它会警告
-"omitted these incompatible systems"；加上之后对非本机架构只求值不构建。
+`--all-systems` is there because the flake covers both `x86_64-linux` and `aarch64-linux`;
+without it nix warns "omitted these incompatible systems". With it, foreign architectures
+are evaluated but not built.
 
-## 本地验证（不进 nix build）
+## Local verification (not through `nix build`)
 
-`cargo check` 比 `nix build` 快，改代码时用：
+`cargo check` is faster than `nix build` while editing:
 
 ```bash
 nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc -c cargo check
 ```
 
-`gcc` 是必需的：`image` 的依赖链里有 build script 要调 `cc`，只装 cargo/rustc 会报
-`linker 'cc' not found`。
+`gcc` is required: something in `image`'s dependency chain has a build script that calls
+`cc`, and cargo/rustc alone fail with `linker 'cc' not found`.
 
-## 踩过的坑
+## Pitfalls
 
-1. **`ext_foreign_toplevel_list_v1` 的 `toplevel` 事件会创建新对象**，`wayland-client` 要求
-   显式实现 `Dispatch::event_created_child`，否则运行到那一步直接 panic
-   （"Missing event_created_child specialization"）。用 `event_created_child!` 宏补。
-2. **COSMIC 的 shm format 是 ABGR8888 / XBGR8888**（`0x34324241` / `0x34324258`），
-   不是常见的 ARGB/XRGB。内存字节序是 R,G,B,A，正好可以直接拷进 `RgbaImage`，不用交换。
-3. **`src` 里不能有 `target/`**，否则每次构建哈希都变。`cleanCargoSource` 走的是
-   `lib.cleanSource`（先剔 target/.git/编辑器临时文件）再叠 cargo 过滤，已经规避。
-4. **`vendorCargoDeps` 会把 `cleanSourceWith` 拆掉**。它内部是
-   `origSrc = src: if src._isLibCleanSourceWith or false then src.origSrc else src;`，
-   也就是说传 `cleanCargoSource ./.` 进去等于传原始目录，那层过滤在 vendor 上下文里
-   从未生效。它真正只用两个东西：找 `.cargo/config`、`readFile` 锁文件。
-   所以本仓库直接给 `cargoLock = ./Cargo.lock`，连 `src` 都不传。
-5. **`buildPackage` 的 args 会被 deps 派生继承**。`cargoArtifacts` 是用同一份 args 派生的
-   （`buildDepsOnly (args // memoizedArgs // { installPhase = ...; })`），crane 只覆盖
-   `installPhase`，注释里写着 "we intentionally don't run any caller-provided hooks here"，
-   但 `postFixup` / `postInstall` 原样透传。deps 的 `$out` 里只有 `target.tar.zst`，
-   没有 `bin/`，于是 `wrapProgram` 报 "Cannot wrap ... because it does not exist"。
-   **规矩：所有 `postFixup` / `postInstall` 一律用 `.overrideAttrs` 加。**
-6. **锁屏时 capture 会静默挂起**。cosmic-greeter 挂着时 `create_session` 一切正常，
-   `capture()` 永远不回事件，只能靠 5 秒超时兜底。排查时差点当成 cosmic-comp 的 shm
-   路径没实现——其实是屏幕锁着。
+1. **`ext_foreign_toplevel_list_v1`'s `toplevel` event creates a new object**, and
+   `wayland-client` requires an explicit `Dispatch::event_created_child` implementation;
+   without it the run panics at that point ("Missing event_created_child specialization").
+   The `event_created_child!` macro covers it.
+2. **COSMIC's shm formats are ABGR8888 / XBGR8888** (`0x34324241` / `0x34324258`), not the
+   usual ARGB/XRGB. The bytes in memory are R,G,B,A, so they go straight into `RgbaImage`
+   with no swizzle.
+3. **`src` must not contain `target/`**, or the hash changes on every build.
+   `cleanCargoSource` goes through `lib.cleanSource` (which strips target/.git/editor
+   temporaries) before applying the cargo filter, so this is already handled.
+4. **`vendorCargoDeps` strips `cleanSourceWith`.** Internally it does
+   `origSrc = src: if src._isLibCleanSourceWith or false then src.origSrc else src;`, so
+   passing `cleanCargoSource ./.` hands it the raw directory — the filter never applied in
+   the vendor context. It really only uses two things: it looks for `.cargo/config` and it
+   `readFile`s the lock. This repository therefore passes `cargoLock = ./Cargo.lock` and no
+   `src` at all.
+5. **`buildPackage`'s args are inherited by the deps derivation.** `cargoArtifacts` is
+   derived from the same args (`buildDepsOnly (args // memoizedArgs // { installPhase =
+   ...; })`); crane only overrides `installPhase` — its comment says "we intentionally don't
+   run any caller-provided hooks here" — but `postFixup` / `postInstall` pass straight
+   through. The deps `$out` holds only `target.tar.zst` and no `bin/`, so `wrapProgram`
+   fails with "Cannot wrap ... because it does not exist".
+   **Rule: always add `postFixup` / `postInstall` through `.overrideAttrs`.**
+6. **Capture silently hangs while the screen is locked.** With cosmic-greeter running,
+   `create_session` succeeds and `capture()` never returns an event; only the 5-second
+   timeout catches it. While debugging this I nearly blamed an unimplemented shm path in
+   cosmic-comp — the screen was simply locked.
