@@ -47,8 +47,10 @@
 | `click` | 按截图坐标点击（先移动、等悬停、再按下） | /dev/uinput |
 | `move` | 移动指针悬停 | /dev/uinput |
 | `scroll` | 滚轮 | /dev/uinput |
-| `type_text` | 打 ASCII 文本 | /dev/uinput |
+| `type_text` | ASCII 走按键；**非 ASCII（中文等）自动走剪贴板 + ctrl+v** | uinput + wl-clipboard |
 | `key` | 按组合键，如 `ctrl+s` | /dev/uinput |
+| `clipboard_write` | 写剪贴板（不粘贴） | wl-copy（来自 wl-clipboard） |
+| `clipboard_read` | 读剪贴板 | wl-paste |
 
 坐标一律是**截图像素的坐标**，截图不缩放，所以不需要换算。
 
@@ -82,7 +84,11 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
 ## 已知限制
 
 1. **拿不到窗口状态**。`ext-foreign-toplevel-list` 协议本身不带 focused / minimized / geometry，只有 `wlr-foreign-toplevel-management` 带，而 COSMIC 没实现它。所以 `list_windows` 只能告诉你「有哪些窗口」，不能告诉你「焦点在哪」——那个要靠截图看。
-2. **`type_text` 只支持 ASCII**。uinput 发的是按键，不是字符，中文需要输入法。中文内容请走剪贴板。
+2. **`type_text` 的中文路径已经打通**。按键只能表达 US 布局 ASCII，所以非 ASCII 内容自动改为
+   写剪贴板再 ctrl+v；剪贴板由 wl-clipboard 提供（打包时自动带进 PATH，无需手装）。
+   已实测：`clipboard_write` 中文读回一致，且同时提供 XWayland 兼容的
+   `TEXT`/`STRING`/`UTF8_STRING` 类型，Chrome/Electron 应用可粘贴。
+   一个特性：Wayland 选区跟着持有进程走，MCP server 退出后剪贴板内容就没了。
 3. **坐标只对主输出（index 0）**。`/dev/uinput` 的绝对坐标范围按主输出尺寸建，多屏时第二块屏的坐标会错。截图本身可以指定 `output`。
 4. **HiDPI 下的坐标映射未验证**。这台机器 `scale=2`，`wl_output` 的 mode 报的是物理像素（1920x1080），uinput 的绝对范围也按物理像素建；compositor 把绝对指针映射到逻辑坐标时是乘还是除 scale，需要实测一次 `click` 才能确认。`scale=1` 的机器没有这个问题。EIS 后端没有这个问题。
 5. **`/dev/uinput` 需要写权限**。NixOS 上加一条 udev 规则，或者把用户放进 `uinput` 组。EIS 后端不需要。

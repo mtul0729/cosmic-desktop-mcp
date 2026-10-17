@@ -6,6 +6,7 @@
 //!   - `uinput`          /dev/uinput (COSMIC has no virtual-pointer protocol)
 //!   - `eis`             optional libei backend via the RemoteDesktop portal
 
+mod clipboard;
 mod eis;
 mod mcp;
 mod uinput;

@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::clipboard;
 use crate::uinput::{Button, Device, parse_chord};
 use crate::wl::{capture, toplevel};
 
@@ -157,13 +158,30 @@ first, waits for the compositor to register the hover, then presses and releases
         },
         {
             "name": "type_text",
-            "description": "Type printable ASCII into the focused window. Non-ASCII (e.g. Chinese) \
-is rejected: it needs an input method, which a uinput device cannot drive.",
+            "description": "Type text into the focused window. ASCII is sent as keycodes; anything \
+else (Chinese, emoji, accented characters) is put on the clipboard and pasted with ctrl+v, so it \
+works in any text field that supports paste.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"]
             }
+        },
+        {
+            "name": "clipboard_write",
+            "description": "Put text on the clipboard without pasting it. Useful when the target \
+cannot take ctrl+v, or when the same text is pasted several times. The entry lives as long as \
+this server process.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "clipboard_read",
+            "description": "Read the current clipboard as text.",
+            "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "key",
@@ -192,6 +210,8 @@ fn call_tool(params: Option<&Value>) -> Result<Value> {
         "move" => tool_move(&args),
         "scroll" => tool_scroll(&args),
         "type_text" => tool_type_text(&args),
+        "clipboard_write" => tool_clipboard_write(&args),
+        "clipboard_read" => tool_clipboard_read(),
         "key" => tool_key(&args),
         other => bail!("unknown tool {other:?}"),
     };
@@ -292,8 +312,39 @@ fn tool_type_text(args: &Value) -> Result<String> {
         .get("text")
         .and_then(Value::as_str)
         .context("missing text")?;
-    device()?.type_text(text)?;
-    Ok(format!("typed {} characters", text.chars().count()))
+
+    // Keycodes are US-layout ASCII only. Everything else has to travel as
+    // clipboard data and be pasted, which is also what a human would do.
+    let ascii = text
+        .chars()
+        .all(|c| c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\t');
+    if ascii {
+        device()?.type_text(text)?;
+        return Ok(format!("typed {} characters", text.chars().count()));
+    }
+
+    clipboard::write(text)?;
+    // The compositor needs to see the new selection before the paste request,
+    // otherwise the target reads the previous contents.
+    std::thread::sleep(Duration::from_millis(120));
+    press_chord("ctrl+v")?;
+    Ok(format!(
+        "pasted {} characters via the clipboard (ctrl+v)",
+        text.chars().count()
+    ))
+}
+
+fn tool_clipboard_write(args: &Value) -> Result<String> {
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .context("missing text")?;
+    clipboard::write(text)?;
+    Ok(format!("clipboard set ({} characters)", text.chars().count()))
+}
+
+fn tool_clipboard_read() -> Result<String> {
+    clipboard::read()
 }
 
 fn tool_key(args: &Value) -> Result<String> {
@@ -301,8 +352,12 @@ fn tool_key(args: &Value) -> Result<String> {
         .get("combo")
         .and_then(Value::as_str)
         .context("missing combo")?;
-    let codes = parse_chord(combo)?;
+    press_chord(combo)?;
+    Ok(format!("pressed {combo}"))
+}
 
+fn press_chord(combo: &str) -> Result<()> {
+    let codes = parse_chord(combo)?;
     let device = device()?;
     for code in &codes {
         device.key(*code, true)?;
@@ -310,7 +365,7 @@ fn tool_key(args: &Value) -> Result<String> {
     for code in codes.iter().rev() {
         device.key(*code, false)?;
     }
-    Ok(format!("pressed {combo}"))
+    Ok(())
 }
 
 fn int_arg(args: &Value, key: &str) -> Result<i32> {

@@ -59,6 +59,14 @@
           # live compositor, which the build sandbox does not have.
           doCheck = false;
 
+          # Clipboard support shells out to wl-copy/wl-paste rather than
+          # reimplementing ext-data-control (see src/clipboard.rs).
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          postFixup = ''
+            wrapProgram $out/bin/cosmic-desktop-mcp \
+              --prefix PATH : ${lib.makeBinPath [ pkgs.wl-clipboard ]}
+          '';
+
           separateDebugInfo = true;
 
           meta = {
@@ -80,6 +88,9 @@
             pkgs.rustc
             pkgs.rustfmt
             pkgs.clippy
+            # Runtime dependency of the clipboard tools, so `cargo run` behaves
+            # like the packaged binary.
+            pkgs.wl-clipboard
           ];
         };
       }
