@@ -30,18 +30,23 @@
         lib = pkgs.lib;
         craneLib = crane.mkLib pkgs;
 
-        # Only what cargo reads. `.jj`, `.git`, `target/` and docs stay out, so
-        # the local drv hash matches CI's clean checkout and cachix hits.
-        # `rust-toolchain.toml` is deliberately excluded: inside the sandbox it
-        # would make cargo try to call rustup.
-        src = lib.fileset.toSource {
-          root = ./.;
-          fileset = lib.fileset.unions [
-            ./Cargo.toml
-            ./Cargo.lock
-            ./src
-          ];
-        };
+        # crane's own filter, not a hand-written whitelist. It keeps every
+        # `*.rs` and `*.toml` plus the full directory skeleton, so `build.rs`,
+        # `.cargo/config.toml`, `tests/`, `benches/` and `examples/` are picked
+        # up the moment they appear.
+        #
+        # A whitelist (`fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ]`) was
+        # tried first and is a trap: a missing `build.rs` is not an error for
+        # cargo, it just means "no build script", so the sandbox would silently
+        # build a different binary than `cargo build` in the devShell does. Same
+        # for `.cargo/config.toml` and its rustflags. What the filter cannot
+        # keep — non-rs/non-toml assets pulled in by `include_bytes!` — fails
+        # compilation loudly instead, which is the way round you want.
+        #
+        # Side effect: `rust-toolchain.toml` is a .toml, so it is now in the
+        # store. Harmless — only rustup reads that file, and nix's cargo is the
+        # real binary (verified: a bogus channel name there changes nothing).
+        src = craneLib.cleanCargoSource ./.;
 
         # Vendoring needs nothing but the lockfile: crane readFile()s
         # `cargoLock` at eval time and never walks the source tree, so editing
