@@ -19,6 +19,10 @@ wayland-client = "0.31"
 # pointer-warp. COSMIC implements all three; nothing here needs a private
 # zcosmic_* protocol.
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+# Generated bindings for the COSMIC protocol extensions. Only `client` is
+# needed; the crate ships the XML it scans, so this adds no build.rs of ours.
+# `zcosmic_toplevel_info_v1` is the one protocol that carries window geometry.
+cosmic-protocols = { version = "0.2", default-features = false, features = ["client"] }
 # Optional libei backend. The RemoteDesktop portal hands out an EIS socket,
 # which the compositor treats as a remote-desktop session rather than as a new
 # input device. `reis` is the Rust EI/EIS implementation (same one libei ships).

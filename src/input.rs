@@ -183,6 +183,36 @@ pub fn outputs() -> Result<Vec<capture::OutputInfo>> {
     capture::outputs().context("enumerate outputs")
 }
 
+/// Converts a rect that the compositor reported relative to `output` (logical
+/// coordinates) into that output's screenshot pixel space.
+///
+/// Same scale problem as `logical()`, same answer: the EIS region's scale is
+/// the only trustworthy source. The region's origin cancels out — the
+/// compositor's window geometry is already relative to the output, and so is a
+/// screenshot — so only the multiplication remains.
+pub fn to_pixels(rect: crate::wl::toplevel::Rect, output: usize) -> Result<crate::wl::toplevel::Rect> {
+    let out = outputs()?
+        .into_iter()
+        .nth(output)
+        .with_context(|| format!("no output #{output}"))?;
+    let session = eis::session()?;
+    let scale = region_for(&out, &session.regions())?.region.scale;
+    Ok(scale_rect(rect, scale))
+}
+
+/// Multiplies a logical rect by `scale`. Pure, so callers that must not open
+/// an EIS session (anything status-like) can do the conversion from a region
+/// they already have.
+pub fn scale_rect(rect: crate::wl::toplevel::Rect, scale: f64) -> crate::wl::toplevel::Rect {
+    let scaled = |value: i32| (f64::from(value) * scale).round() as i32;
+    crate::wl::toplevel::Rect {
+        x: scaled(rect.x),
+        y: scaled(rect.y),
+        width: scaled(rect.width),
+        height: scaled(rect.height),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

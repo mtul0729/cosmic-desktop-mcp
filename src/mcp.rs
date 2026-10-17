@@ -111,9 +111,56 @@ exist, or when a click seems to do nothing and you need to know whether input is
         },
         {
             "name": "list_windows",
-            "description": "List open toplevel windows with a stable identifier, title and app_id. \
-Window state (focused/minimized) is not available on COSMIC.",
+            "description": "List open windows with identifier, title, app_id, COSMIC state \
+(maximized/minimized/activated/fullscreen/sticky) and **placement**. Geometry comes from \
+zcosmic_toplevel_info_v1 and is reported twice: \"logical\" (compositor coordinates relative to \
+the output) and \"pixels\" (the same rect in that output's screenshot space, ready to pass to \
+click/move/scroll). \"pixels\" is null until the input session exists, because the logical-to-\
+pixel factor is only trustworthy when it comes from the EIS region. Use this instead of \
+guessing where a window is.",
             "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "screenshot_window",
+            "description": "Capture one window: finds the window's output, screenshots it and crops \
+to the window rect. Returns the PNG path, the crop size and the window's origin **in that \
+output's screenshot pixel space**, so a point (dx,dy) inside the returned image is \
+click(x=origin_x+dx, y=origin_y+dy, output=output_index). The crop shows whatever is on screen \
+in that region: if the window is covered (fullscreen video, another window on top) activate it \
+with window_action first. May open the input session (and a portal dialog) on first use, because \
+the crop needs the output's scale factor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "description": "Window identifier, app_id, or exact/unique title substring."
+                    }
+                },
+                "required": ["window"]
+            }
+        },
+        {
+            "name": "window_action",
+            "description": "Ask the compositor to act on a window: activate, close, maximize, \
+unmaximize, minimize, unminimize, fullscreen, unfullscreen (zcosmic_toplevel_manager_v1). \
+**Use activate before typing**: an EIS click does not move keyboard focus on COSMIC, so click + \
+type_text lands in whatever was focused before unless the window is activated first. The \
+compositor may ignore a request; re-list to confirm the resulting state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "description": "Window identifier, app_id, or exact/unique title substring."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["activate", "close", "maximize", "unmaximize", "minimize", "unminimize", "fullscreen", "unfullscreen"]
+                    }
+                },
+                "required": ["window", "action"]
+            }
         },
         {
             "name": "click",
@@ -333,6 +380,8 @@ fn call_tool(params: Option<&Value>) -> Result<Value> {
         "screenshot" => tool_screenshot(&args),
         "env_info" => tool_env_info(),
         "list_windows" => tool_list_windows(),
+        "screenshot_window" => tool_screenshot_window(&args),
+        "window_action" => tool_window_action(&args),
         "click" => tool_click(&args),
         "move" => tool_move(&args),
         "scroll" => tool_scroll(&args),
@@ -541,9 +590,157 @@ fn tool_config_write(args: &Value) -> Result<String> {
     Ok(serde_json::to_string_pretty(&config::write(app, key, value)?)?)
 }
 
+/// Returns the index of the output with connector `name`, if still present.
+fn output_index_for(name: &str, outputs: &[capture::OutputInfo]) -> Option<usize> {
+    outputs
+        .iter()
+        .find(|out| out.name.as_deref() == Some(name))
+        .map(|out| out.index)
+}
+
 fn tool_list_windows() -> Result<String> {
     let windows = toplevel::list()?;
-    Ok(serde_json::to_string_pretty(&windows)?)
+    let outputs = input::outputs()?;
+    // `peek` never opens a session, so listing stays free of authorization
+    // dialogs; without regions the pixel rect is simply null.
+    let regions = crate::eis::peek()
+        .map(|session| session.regions())
+        .unwrap_or_default();
+
+    let rows: Vec<Value> = windows
+        .iter()
+        .map(|window| {
+            let index = window
+                .output
+                .as_deref()
+                .and_then(|name| output_index_for(name, &outputs));
+            // Only convert when a region is available; guessing a scale is
+            // how coordinates end up off by 20%.
+            let pixels = match (index, window.logical) {
+                (Some(index), Some(rect)) => match input::region_for(&outputs[index], &regions) {
+                    Ok(matched) => json!(input::scale_rect(rect, matched.region.scale)),
+                    Err(_) => Value::Null,
+                },
+                _ => Value::Null,
+            };
+            json!({
+                "identifier": window.identifier,
+                "title": window.title,
+                "app_id": window.app_id,
+                "state": window.state,
+                "output": index.map(|index| json!({
+                    "index": index,
+                    "name": window.output,
+                })),
+                "logical": window.logical,
+                "pixels": pixels,
+            })
+        })
+        .collect();
+
+    let mut notes = vec![
+        "`logical` is the compositor's placement relative to `output`, in logical coordinates; \
+         `pixels` is the same rect in that output's screenshot pixel space, which is what \
+         click/move/scroll accept. `pixels` is null until the EIS session exists."
+            .to_string(),
+        "geometry is placement as last reported, not visibility: a fullscreen or simply \
+         overlapping window still sits at its tiled coordinates, so the region can show \
+         something else. window_action activate brings a window to the top."
+            .to_string(),
+    ];
+    if windows.iter().any(|window| window.logical.is_none()) {
+        notes.push(
+            "some windows have no geometry yet: the compositor sends it on the first map and \
+             again on every move/resize, so re-list after a moment"
+                .to_string(),
+        );
+    }
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "count": rows.len(),
+        "windows": rows,
+        "notes": notes,
+    }))?)
+}
+
+/// Crops the window out of a screenshot of its output.
+///
+/// Needs the EIS region for the scale factor, so the first call may open a
+/// session (and with it a portal authorization dialog).
+fn tool_screenshot_window(args: &Value) -> Result<String> {
+    let needle = args
+        .get("window")
+        .and_then(Value::as_str)
+        .context("screenshot_window needs \"window\" (identifier, app_id or title)")?;
+    let windows = toplevel::list()?;
+    let target = toplevel::find(&windows, needle)?;
+
+    let rect = target
+        .logical
+        .with_context(|| format!("{:?} has no geometry yet", target.title))?;
+    let name = target
+        .output
+        .clone()
+        .context("the window geometry carries no output name")?;
+    let outputs = input::outputs()?;
+    let index = output_index_for(&name, &outputs).with_context(|| {
+        format!("window is on output {name}, which is no longer in the output list")
+    })?;
+
+    let px = input::to_pixels(rect, index)?;
+    let shot = capture::capture(index)?;
+
+    // Clamp: a window can be partly off-screen, and a zero-sized crop is an
+    // error deep inside the image crate.
+    let left = px.x.clamp(0, shot.width as i32);
+    let top = px.y.clamp(0, shot.height as i32);
+    let right = (px.x + px.width).clamp(0, shot.width as i32);
+    let bottom = (px.y + px.height).clamp(0, shot.height as i32);
+    if right <= left || bottom <= top {
+        bail!(
+            "the window is entirely outside output {name} ({left},{top})-({right},{bottom})"
+        );
+    }
+    let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+
+    let image = image::RgbaImage::from_raw(shot.width, shot.height, shot.rgba)
+        .context("captured frame did not match its declared size")?;
+    let cropped = image::imageops::crop_imm(&image, left as u32, top as u32, width, height).to_image();
+
+    let dir = runtime_dir().join("cosmic-desktop-mcp");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("window-{stamp}.png"));
+    cropped
+        .save_with_format(&path, image::ImageFormat::Png)
+        .with_context(|| format!("write {}", path.display()))?;
+
+    Ok(format!(
+        "{}\n{width}x{height} from output_index={index} ({name}), window {:?}\n\
+window origin in that output's screenshot pixels: x={left} y={top}\n\
+to click something at (dx,dy) inside this image use click(x={left}+dx, y={top}+dy, output={index})",
+        path.display(),
+        target.title
+    ))
+}
+
+fn tool_window_action(args: &Value) -> Result<String> {
+    let needle = args
+        .get("window")
+        .and_then(Value::as_str)
+        .context("window_action needs \"window\" (identifier, app_id or title)")?;
+    let action = toplevel::Action::parse(
+        args.get("action")
+            .and_then(Value::as_str)
+            .context("window_action needs \"action\"")?,
+    )?;
+    let done = toplevel::act(needle, action)?;
+    Ok(format!(
+        "{done}\nthe compositor may ignore a request; re-run list_windows to see the resulting state"
+    ))
 }
 
 fn tool_click(args: &Value) -> Result<String> {
