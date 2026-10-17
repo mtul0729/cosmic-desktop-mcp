@@ -31,7 +31,8 @@
 | 能力 | 状态 |
 |---|---|
 | `list_windows` | ✅ 通，输出和 `lswt -j` 一致 |
-| 键鼠（`click` / `move` / `scroll` / `type_text` / `key`） | ✅ `/dev/uinput` 设备创建成功 |
+| 键鼠（`click` / `move` / `scroll` / `type_text` / `key`） | ✅ 默认走 EIS（libei），`/dev/uinput` 可回退 |
+| 滚轮方向 | ✅ 实测：dy 正数向上、负数向下（REL_WHEEL 惯例） |
 | `screenshot` | ✅ 通，颜色/方向正确 |
 
 **一个重要行为**：锁屏时（cosmic-greeter 挂着）COSMIC 会挂起 capture——`create_session`
@@ -44,11 +45,11 @@
 |---|---|---|
 | `screenshot` | 截一个输出，存 PNG，返回路径 | ext-image-copy-capture + wl_shm |
 | `list_windows` | 列出窗口的 identifier / title / app_id | ext-foreign-toplevel-list |
-| `click` | 按截图坐标点击（先移动、等悬停、再按下） | /dev/uinput |
-| `move` | 移动指针悬停 | /dev/uinput |
-| `scroll` | 滚轮 | /dev/uinput |
-| `type_text` | **一律走剪贴板 + ctrl+v**（默认）；`mode:"keys"` 才发 keycode | uinput + wl-clipboard |
-| `key` | 按组合键，如 `ctrl+s` | /dev/uinput |
+| `click` | 按截图坐标点击（先移动、等悬停、再按下） | EIS / uinput |
+| `move` | 移动指针悬停 | EIS / uinput |
+| `scroll` | 滚轮，`dy` 正数向上、负数向下 | EIS / uinput |
+| `type_text` | **一律走剪贴板 + ctrl+v**（默认）；`mode:"keys"` 才发 keycode | wl-clipboard + EIS |
+| `key` | 按组合键，如 `ctrl+s` | EIS / uinput |
 | `clipboard_write` | 写剪贴板（不粘贴） | wl-copy（来自 wl-clipboard） |
 | `clipboard_read` | 读剪贴板 | wl-paste |
 
@@ -82,8 +83,16 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
   否则 `ei_seat.bind` 根本发不出去，表现为「seat 到了但永远没有 device」。
 - EIS 会话期间合成器会限制真实输入吗？实测不会——点击、截图都正常。
 
-还没有做的事：MCP 工具层（`click` 等）仍走 uinput；把 EIS 做成长驻会话的后端
-（EiEvent 不是 Send，需要独占线程 + 通道）是下一步，收益是丢掉 uinput 依赖和 HiDPI 坐标问题。
+- **`scroll` 的 `dy` 是轮格数，正数向上**（跟内核 `REL_WHEEL` 一致），负数向下。
+  `ei_scroll` 的 y 轴正方向朝下，所以 `src/input.rs` 传进去的是 `-dy`——
+  在滚动区底部传 `dy=-1` 看到的是「什么也没发生」，别误判成事件没送到。
+- 滚动是用自建可控窗口验证的：`kitty -o font_size=26 sh -c 'seq 1 300; exec sleep 900'`，
+  内容带行号，向上滚 3 格视口从 295–300 变成 280–300，向下 15 格精确回底。
+  面板时钟那种目标不可靠——它可能压根不响应滚轮。
+
+MCP 工具层在 2026-10-17 已切到 EIS：`src/input.rs` 做后端分发，默认 EIS，
+`COSMIC_DESKTOP_INPUT=uinput` 可回退。EIS 会话常驻（`EiEvent` 不是 `Send`，独占一个线程
++ 通道注入命令），所以 `/dev/uinput` 不再是必需依赖，也没有 HiDPI 坐标换算问题。
 
 ## 已知限制
 
@@ -95,9 +104,9 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
    已实测：`clipboard_write` 中文读回一致，且同时提供 XWayland 兼容的
    `TEXT`/`STRING`/`UTF8_STRING` 类型，Chrome/Electron 应用可粘贴。
    一个特性：Wayland 选区跟着持有进程走，MCP server 退出后剪贴板内容就没了。
-3. **坐标只对主输出（index 0）**。`/dev/uinput` 的绝对坐标范围按主输出尺寸建，多屏时第二块屏的坐标会错。截图本身可以指定 `output`。
-4. **HiDPI 下的坐标映射未验证**。这台机器 `scale=2`，`wl_output` 的 mode 报的是物理像素（1920x1080），uinput 的绝对范围也按物理像素建；compositor 把绝对指针映射到逻辑坐标时是乘还是除 scale，需要实测一次 `click` 才能确认。`scale=1` 的机器没有这个问题。EIS 后端没有这个问题。
-5. **`/dev/uinput` 需要写权限**。NixOS 上加一条 udev 规则，或者把用户放进 `uinput` 组。EIS 后端不需要。
+3. **uinput 后端的坐标只对主输出（index 0）**。绝对坐标范围按主输出尺寸建，多屏时第二块屏的坐标会错。EIS 后端用 region 拼图换算，没有这个问题；截图本身也可以指定 `output`。
+4. **uinput 后端在 HiDPI 下要自己扛映射**。`wl_output` 的 mode 报物理像素，uinput 的绝对范围也按物理像素建，compositor 换算方向得实测。EIS 后端全程逻辑坐标，不存在这个问题（本机 DP-2 scale 1.25 / eDP-1 scale 1.5 已实测）。
+5. **只有回退到 uinput 才需要 `/dev/uinput` 写权限**。NixOS 上加一条 udev 规则，或者把用户放进 `uinput` 组。默认的 EIS 后端不需要。
 
 ## 安装
 
