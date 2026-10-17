@@ -411,7 +411,12 @@ fn wait(
     let deadline = Instant::now() + Duration::from_secs(5);
     while !done(state) {
         if Instant::now() > deadline {
-            bail!("timed out after 5s; events seen: {:?}", state.log);
+            bail!(
+                "timed out after 5s; events seen: {:?} — a session lock screen \
+                 commonly produces exactly this silence, so check whether the \
+                 screen is locked before blaming the tool",
+                state.log
+            );
         }
         queue
             .roundtrip(state)

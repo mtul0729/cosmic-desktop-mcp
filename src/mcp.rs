@@ -721,8 +721,12 @@ fn tool_screenshot_window(args: &Value) -> Result<String> {
     Ok(format!(
         "{}\n{width}x{height} from output_index={index} ({name}), window {:?}\n\
 window origin in that output's screenshot pixels: x={left} y={top}\n\
-to click something at (dx,dy) inside this image use click(x={left}+dx, y={top}+dy, output={index})",
+to click something at (dx,dy) inside this image use click(x={left}+dx, y={top}+dy, output={index})\n\
+the crop is a rectangle cut from the output at the window's last reported placement, so if the \
+image does not look like {:?} at all, the window is occluded or the session is locked: run \
+window_action activate first and capture again",
         path.display(),
+        target.title,
         target.title
     ))
 }

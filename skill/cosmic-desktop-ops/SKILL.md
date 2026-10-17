@@ -113,6 +113,23 @@ keystrokes does.**
   guarantee), so check where focus is before concluding a window opened on the
   wrong screen.
 
+## Lock screen (everything lies until you notice it)
+
+When the session is locked the tools do not fail loudly — they mislead:
+
+- full-screen `screenshot` **times out** with "timed out after 5s" (the
+  compositor offers no frames),
+- `screenshot_window` still "succeeds" but the crop is a rectangle of **lock
+  screen pixels**, because the window's geometry is unaffected by what covers
+  it,
+- every window looks frozen: clicks land nowhere useful, and activating does
+  nothing.
+
+If output suddenly looks like a greeter or stops making sense, **check the
+clock and whether the session is locked before debugging anything else.** One
+real incident cost half an hour this way. Ask the user to unlock; do not try
+to automate your way out.
+
 ## Applets and the panel
 
 `applets` lists every applet from `/proc`: name (taken from `argv[0]`, **not**
