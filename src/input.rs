@@ -10,16 +10,13 @@
 //! Coordinates entering this module are pixels of a screenshot; EIS speaks
 //! logical desktop coordinates, and `logical()` converts between them.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 
 use crate::eis;
 use crate::keymap::{self, Button};
 use crate::wl::capture;
-
-static OUTPUTS: OnceLock<Vec<capture::OutputInfo>> = OnceLock::new();
 
 pub fn describe() -> Result<String> {
     Ok(format!(
@@ -108,29 +105,142 @@ fn set_button(button: Button, pressed: bool) -> Result<()> {
 /// region's own scale is the only correct source.
 fn logical(x: i32, y: i32, output: usize) -> Result<(f64, f64)> {
     let out = outputs()?
-        .get(output)
+        .into_iter()
+        .nth(output)
         .with_context(|| format!("no output #{output}"))?;
     let session = eis::session()?;
-    let regions = session.regions();
-    let region = regions
-        .iter()
-        .find(|region| region.physical_size() == (out.width, out.height))
-        .with_context(|| {
-            format!(
-                "no EIS region matches output #{output} ({}x{}); regions: {regions:?}",
-                out.width, out.height
-            )
-        })?;
+    let matched = region_for(&out, &session.regions())?;
+    let region = matched.region;
     Ok((
         region.x + f64::from(x) / region.scale,
         region.y + f64::from(y) / region.scale,
     ))
 }
 
-fn outputs() -> Result<&'static [capture::OutputInfo]> {
-    if OUTPUTS.get().is_none() {
-        let list = capture::outputs().context("enumerate outputs")?;
-        let _ = OUTPUTS.set(list);
+/// An EIS region and how it was tied to a `wl_output`.
+pub struct RegionMatch {
+    pub region: eis::Region,
+    /// `"name"` when `wl_output.name` met the region's `mapping_id`, `"size"`
+    /// when it had to be inferred from the physical resolution.
+    pub by: &'static str,
+}
+
+/// Finds the EIS region that corresponds to `out`.
+///
+/// Name first: `wl_output.name` and the region's `mapping_id` are the same
+/// connector string (`DP-2`, `eDP-1`). Only when a side lacks a name does this
+/// fall back to matching physical size, and then only if exactly one region
+/// has that size. The old unconditional `find` picked the first of several
+/// same-sized regions, which made `output: 1` clicks land silently on output 0
+/// with two identical monitors.
+pub fn region_for(out: &capture::OutputInfo, regions: &[eis::Region]) -> Result<RegionMatch> {
+    if let Some(name) = out.name.as_deref() {
+        if let Some(region) = regions
+            .iter()
+            .find(|region| region.mapping_id.as_deref() == Some(name))
+        {
+            return Ok(RegionMatch {
+                region: region.clone(),
+                by: "name",
+            });
+        }
     }
-    Ok(OUTPUTS.get().map(Vec::as_slice).unwrap_or(&[]))
+
+    let same_size: Vec<&eis::Region> = regions
+        .iter()
+        .filter(|region| region.physical_size() == (out.width, out.height))
+        .collect();
+    match same_size.len() {
+        1 => Ok(RegionMatch {
+            region: same_size[0].clone(),
+            by: "size",
+        }),
+        0 => bail!(
+            "no EIS region matches output #{} ({}x{}{})",
+            out.index,
+            out.width,
+            out.height,
+            out.name
+                .as_deref()
+                .map(|name| format!(" {name}"))
+                .unwrap_or_default()
+        ),
+        count => bail!(
+            "output #{} ({}) matches {count} EIS regions of the same physical size and cannot be \
+             told apart; the compositor did not report a usable connector name",
+            out.index,
+            out.name.as_deref().unwrap_or("unnamed")
+        ),
+    }
+}
+
+/// Enumerates outputs right now.
+///
+/// Deliberately uncached: a cached list goes stale when a monitor is plugged
+/// in, unplugged or rescaled, and the failure mode is clicking on the wrong
+/// place. A fresh roundtrip costs about a millisecond.
+pub fn outputs() -> Result<Vec<capture::OutputInfo>> {
+    capture::outputs().context("enumerate outputs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(name: &str, width: i32, height: i32, scale: f64) -> eis::Region {
+        eis::Region {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            scale,
+            mapping_id: Some(name.into()),
+        }
+    }
+
+    fn output(name: Option<&str>, width: i32, height: i32) -> capture::OutputInfo {
+        capture::OutputInfo {
+            index: 0,
+            name: name.map(Into::into),
+            width,
+            height,
+            scale: 1,
+        }
+    }
+
+    #[test]
+    fn matching_name_wins_over_size() {
+        let regions = vec![
+            region("DP-1", 1920, 1080, 1.0),
+            region("DP-2", 1920, 1080, 1.0),
+        ];
+        let matched = region_for(&output(Some("DP-2"), 1920, 1080), &regions).unwrap();
+        assert_eq!(matched.by, "name");
+        assert_eq!(matched.region.mapping_id.as_deref(), Some("DP-2"));
+    }
+
+    /// Two identical monitors and no names anywhere: the old `find` silently
+    /// picked the first region, sending `output: 1` clicks to output 0. This
+    /// must stay a loud error.
+    #[test]
+    fn identical_sizes_without_names_is_an_error_not_a_guess() {
+        let regions = vec![
+            region("DP-1", 1920, 1080, 1.0),
+            region("DP-2", 1920, 1080, 1.0),
+        ];
+        assert!(region_for(&output(None, 1920, 1080), &regions).is_err());
+    }
+
+    #[test]
+    fn unique_size_still_matches_when_names_are_missing() {
+        // Region width/height are logical; DP-2 at 1.25 measures 2560x1440
+        // physically, matching the output's physical resolution.
+        let regions = vec![
+            region("DP-1", 1920, 1080, 1.0),
+            region("DP-2", 2048, 1152, 1.25),
+        ];
+        let matched = region_for(&output(None, 2560, 1440), &regions).unwrap();
+        assert_eq!(matched.by, "size");
+        assert_eq!(matched.region.mapping_id.as_deref(), Some("DP-2"));
+    }
 }

@@ -44,6 +44,7 @@
 | 工具 | 做什么 | 走什么 |
 |---|---|---|
 | `screenshot` | 截一个输出，存 PNG，返回路径 | ext-image-copy-capture + wl_shm |
+| `env_info` | 桌面拓扑 + 输入后端状态（无副作用，不建 EIS 会话） | wl_output + EIS region |
 | `list_windows` | 列出窗口的 identifier / title / app_id | ext-foreign-toplevel-list |
 | `click` | 按截图坐标点击（先移动、等悬停、再按下） | EIS |
 | `move` | 移动指针悬停 | EIS |
@@ -169,15 +170,28 @@ nix build github:mtul0729/cosmic-desktop-mcp
 ```nix
 {
   inputs.cosmic-desktop-mcp.url = "github:mtul0729/cosmic-desktop-mcp";
-  inputs.cosmic-desktop-mcp.inputs.nixpkgs.follows = "nixpkgs";
-  # ...
-  environment.systemPackages = [ inputs.cosmic-desktop-mcp.packages.${pkgs.system}.default ];
+  # 注意：这里**不要**写 inputs.cosmic-desktop-mcp.inputs.nixpkgs.follows = "nixpkgs"。
+  # 这个包的产物已经推到 cachix `mtul`，drv 是按它自己的 nixpkgs 算出来的；一旦 follow，
+  # 你会得到另一个 drv，缓存命中不了，每次 switch 都要在本机重编 Rust 依赖。
+  # 代价是多一份 nixpkgs 求值进 store，RPATH 指向它自带的那份 glibc，运行时无差别。
+
+  outputs = { self, nixpkgs, cosmic-desktop-mcp, ... }: {
+    # ...
+    environment.systemPackages = [ cosmic-desktop-mcp.packages.${pkgs.system}.default ];
+  };
 }
 ```
 
 ## 自检
 
-不要一上来就接 MCP，先跑：
+自检分两层，给不同的人用：
+
+- **`--doctor` 是人的一次性活**：验证安装、顺手把 EIS 的 portal 授权框点掉。
+  它会真截屏、真建 EIS 会话，有副作用，不适合交给 agent 随时调用。
+- **`env_info` 工具是 agent 的状态查询**：接了 MCP 之后 agent 可以随时调用，
+  无副作用——它用 `eis::peek` 只读已建立的会话，绝不新建，所以不会弹授权框。
+
+接 MCP 前先跑一次 doctor：
 
 ```bash
 cosmic-desktop-mcp --doctor
@@ -187,8 +201,8 @@ cosmic-desktop-mcp --doctor
 
 ```
 wayland: Ok("wayland-1")
-output #0: 1920x1080 scale=2
-output #1: 2560x1440 scale=2
+output #0: 1920x1080 scale=2 name=eDP-1
+output #1: 2560x1440 scale=2 name=DP-2
 toplevels: 2
   WorkBuddy [yKlXztLTFkE6KoyiT4A5RQgQ9OxjLidx] WorkBuddy
   kitty [yMeUdgSO2ua7TSqYvAllKYApFGasyKEg] hx ~/S/p/cosmic-desktop-mcp
@@ -204,6 +218,26 @@ region Some("DP-2") logical x=0 y=0 2048x1152 scale=1.25 -> physical 2560x1440
 
 最后那段 `backend:` 及其后是输入后端自述：会列出合成器给的三类虚拟设备
 （键盘 / 相对指针 / 绝对指针）和每个输出的 region，region 就是坐标换算的依据。
+
+### agent 的状态查询：env_info
+
+MCP 会话里 agent 调 `env_info` 得到一份 JSON：
+
+- `outputs`：每块屏的连接器名（`DP-2`）、物理尺寸、以及匹配到的 EIS region
+  （逻辑原点、逻辑尺寸、真实 scale）。region 与输出的对应**先按名字对齐**
+  （`wl_output.name` == region 的 `mapping_id`），两边都缺名字才退回物理尺寸匹配，
+  而且只在唯一匹配时采用——**同型号双屏（物理尺寸相同）无法区分时会直接报错**，
+  不再像以前那样静默把 output 1 的点击落到 output 0 上。
+- `input.connected`：EIS 会话是否已建立。`false` 时 notes 会说明「第一次 click
+  会弹 portal 授权框，需要人点」——这正是 agent 判断「为什么点了没反应」的依据。
+- `notes`：坐标约定（工具收的是截图像素，逻辑换算在内部做）。
+
+### 什么时候状态会过期
+
+- 授权可以在系统设置里被 revoke，撤销后下次建立会话又会弹框；
+- 插拔屏幕、改缩放、改排列都会改变 region。输出列表每次实时枚举
+  （`input.rs` 不缓存），所以拓扑变化后不用重启 server；
+- 锁屏时 capture 会静默挂起（见 NIX.md），表现为 screenshot 超时。
 
 ## 开发
 

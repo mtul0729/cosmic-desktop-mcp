@@ -108,6 +108,17 @@ pub fn session() -> Result<Session> {
     Ok(fresh)
 }
 
+/// Returns the process-wide EIS session **if one is already open**.
+///
+/// Unlike [`session`] this never starts a session, so it can be used for status
+/// reporting: opening one may put a portal authorization dialog on screen, and
+/// a status query must not do that.
+pub fn peek() -> Option<Session> {
+    let slot = SESSION.get()?;
+    let guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_ref().filter(|session| session.is_alive()).cloned()
+}
+
 impl Session {
     fn open() -> Result<Self> {
         let alive = Arc::new(AtomicBool::new(true));
@@ -220,14 +231,25 @@ impl Session {
     }
 
     pub fn describe(&self) -> String {
-        let state = self.state();
         let mut out = String::new();
+        for line in self.summary_lines() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Same facts as [`Session::describe`], one line per device and per region,
+    /// so a JSON caller can embed them without parsing prose.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let state = self.state();
+        let mut out = Vec::new();
         if state.devices.is_empty() {
-            out.push_str("devices: none\n");
+            out.push("devices: none".to_string());
         }
         for live in &state.devices {
-            out.push_str(&format!(
-                "device {:?} serial={} absolute={} button={} keyboard={} pointer={} scroll={}\n",
+            out.push(format!(
+                "device {:?} serial={} absolute={} button={} keyboard={} pointer={} scroll={}",
                 live.name.as_deref().unwrap_or("<unnamed>"),
                 live.serial,
                 live.absolute,
@@ -239,8 +261,8 @@ impl Session {
         }
         for region in &state.regions {
             let (px, py) = region.physical_size();
-            out.push_str(&format!(
-                "region {:?} logical x={} y={} {}x{} scale={} -> physical {px}x{py}\n",
+            out.push(format!(
+                "region {:?} logical x={} y={} {}x{} scale={} -> physical {px}x{py}",
                 region.mapping_id, region.x, region.y, region.width, region.height, region.scale
             ));
         }

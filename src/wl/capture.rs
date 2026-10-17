@@ -37,6 +37,10 @@ pub struct Shot {
 #[derive(Clone, Debug)]
 pub struct OutputInfo {
     pub index: usize,
+    /// Connector name from the `wl_output` v4 `name` event, e.g. `DP-2`.
+    /// This is what the EIS region reports as `mapping_id`, so the two can be
+    /// matched exactly instead of guessing by physical size.
+    pub name: Option<String>,
     pub width: i32,
     pub height: i32,
     pub scale: i32,
@@ -47,6 +51,7 @@ struct State {
     outputs: Vec<OutputInfo>,
     pending_mode: Option<(i32, i32)>,
     pending_scale: Option<i32>,
+    pending_name: Option<String>,
 
     size: Option<(u32, u32)>,
     formats: Vec<wl_shm::Format>,
@@ -93,11 +98,13 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
                 }
             }
             wl_output::Event::Scale { factor } => state.pending_scale = Some(factor),
+            wl_output::Event::Name { name } => state.pending_name = Some(name),
             wl_output::Event::Done => {
                 if let Some((width, height)) = state.pending_mode.take() {
                     let index = state.outputs.len();
                     state.outputs.push(OutputInfo {
                         index,
+                        name: state.pending_name.take(),
                         width,
                         height,
                         scale: state.pending_scale.take().unwrap_or(1),

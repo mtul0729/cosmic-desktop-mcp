@@ -100,6 +100,14 @@ space, with no downscaling applied.",
             }
         },
         {
+            "name": "env_info",
+            "description": "Report the current desktop topology and whether the input backend is \
+ready. Cheap, side-effect free: it never opens an EIS session, so it cannot raise a portal \
+authorization dialog. Call it before the first click when you do not know how many outputs \
+exist, or when a click seems to do nothing and you need to know whether input is authorized.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
             "name": "list_windows",
             "description": "List open toplevel windows with a stable identifier, title and app_id. \
 Window state (focused/minimized) is not available on COSMIC.",
@@ -226,6 +234,7 @@ fn call_tool(params: Option<&Value>) -> Result<Value> {
 
     let outcome = match name {
         "screenshot" => tool_screenshot(&args),
+        "env_info" => tool_env_info(),
         "list_windows" => tool_list_windows(),
         "click" => tool_click(&args),
         "move" => tool_move(&args),
@@ -274,6 +283,77 @@ fn tool_screenshot(args: &Value) -> Result<String> {
         shot.height,
         shot.output.index
     ))
+}
+
+/// Current topology plus input readiness.
+///
+/// Uses `eis::peek`, never `eis::session`: opening a session can raise a portal
+/// authorization dialog, and a status query must not do that. Consequently
+/// `logical` is null until the first input tool call has authorized.
+fn tool_env_info() -> Result<String> {
+    let outputs = input::outputs()?;
+    let session = crate::eis::peek();
+    let regions = session
+        .as_ref()
+        .map(|session| session.regions())
+        .unwrap_or_default();
+
+    let mut rows = Vec::new();
+    let mut problems = Vec::new();
+    for out in &outputs {
+        let (logical, scale, matched_by) = match input::region_for(out, &regions) {
+            Ok(matched) => (
+                json!({
+                    "x": matched.region.x,
+                    "y": matched.region.y,
+                    "width": matched.region.width,
+                    "height": matched.region.height,
+                }),
+                json!(matched.region.scale),
+                json!(matched.by),
+            ),
+            Err(err) => {
+                if session.is_some() {
+                    problems.push(format!("output #{}: {err:#}", out.index));
+                }
+                (Value::Null, Value::Null, Value::Null)
+            }
+        };
+        rows.push(json!({
+            "index": out.index,
+            "name": out.name,
+            "physical": {"width": out.width, "height": out.height},
+            "logical": logical,
+            "scale": scale,
+            "matched_by": matched_by,
+        }));
+    }
+
+    let mut notes = vec![
+        "click/move/scroll take pixel coordinates of a screenshot of the chosen output; the \
+         conversion to logical desktop coordinates happens inside the tool."
+            .to_string(),
+    ];
+    if session.is_none() {
+        notes.push(
+            "the EIS session is not open yet: the first click opens one and may put a portal \
+             authorization dialog on screen, which a human has to accept"
+                .to_string(),
+        );
+    }
+    notes.extend(problems);
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_VERSION,
+        "input": {
+            "backend": "eis",
+            "connected": session.is_some(),
+            "detail": session.as_ref().map(|session| session.summary_lines()),
+        },
+        "outputs": rows,
+        "notes": notes,
+    }))?)
 }
 
 fn tool_list_windows() -> Result<String> {
@@ -412,8 +492,12 @@ pub fn doctor() -> Result<()> {
     let outputs = capture::outputs().context("enumerate outputs")?;
     for output in &outputs {
         println!(
-            "output #{}: {}x{} scale={}",
-            output.index, output.width, output.height, output.scale
+            "output #{}: {}x{} scale={} name={}",
+            output.index,
+            output.width,
+            output.height,
+            output.scale,
+            output.name.as_deref().unwrap_or("?")
         );
     }
     let windows = toplevel::list().context("list windows")?;
