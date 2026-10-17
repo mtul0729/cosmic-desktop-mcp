@@ -1,0 +1,25 @@
+[package]
+name = "cosmic-desktop-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "MIT"
+description = "MCP server that drives a COSMIC/Wayland desktop: screenshots, window list, pointer and keyboard input"
+repository = "https://github.com/mtul0729/cosmic-desktop-mcp"
+default-run = "cosmic-desktop-mcp"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+wayland-client = "0.31"
+# `staging` carries ext-image-copy-capture, ext-foreign-toplevel-list and
+# pointer-warp. COSMIC implements all three; nothing here needs a private
+# zcosmic_* protocol.
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[profile.release]
+lto = "thin"
+strip = true

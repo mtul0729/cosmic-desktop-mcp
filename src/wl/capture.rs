@@ -1,0 +1,481 @@
+//! Screen capture over `ext_image_copy_capture_v1` + `wl_shm`.
+//!
+//! COSMIC does not implement `wlr-screencopy`, and its portal-based
+//! `cosmic-screenshot` blocks forever when asked for a non-interactive
+//! capture. The staging capture protocol is advertised (global name 17 on this
+//! machine) and needs no dialog, so it is the only usable path.
+
+use std::ffi::CString;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::ptr;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use wayland_client::{
+    Connection, Dispatch, Proxy, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
+    protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool},
+};
+use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+    ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
+    ext_image_copy_capture_manager_v1::{ExtImageCopyCaptureManagerV1, Options},
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
+};
+
+/// A captured frame, in RGBA8, bottom-up row order corrected.
+pub struct Shot {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub output: OutputInfo,
+}
+
+#[derive(Clone, Debug)]
+pub struct OutputInfo {
+    pub index: usize,
+    pub width: i32,
+    pub height: i32,
+    pub scale: i32,
+}
+
+#[derive(Default)]
+struct State {
+    outputs: Vec<OutputInfo>,
+    pending_mode: Option<(i32, i32)>,
+    pending_scale: Option<i32>,
+
+    size: Option<(u32, u32)>,
+    formats: Vec<wl_shm::Format>,
+    session_done: bool,
+    frame_ready: bool,
+    frame_failed: Option<u32>,
+    log: Vec<&'static str>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } => {
+                let current = flags
+                    .into_result()
+                    .map(|f| f.contains(wl_output::Mode::Current))
+                    .unwrap_or(false);
+                if current || state.pending_mode.is_none() {
+                    state.pending_mode = Some((width, height));
+                }
+            }
+            wl_output::Event::Scale { factor } => state.pending_scale = Some(factor),
+            wl_output::Event::Done => {
+                if let Some((width, height)) = state.pending_mode.take() {
+                    let index = state.outputs.len();
+                    state.outputs.push(OutputInfo {
+                        index,
+                        width,
+                        height,
+                        scale: state.pending_scale.take().unwrap_or(1),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_shm::WlShm, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_shm::WlShm,
+        _event: wl_shm::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_shm_pool::WlShmPool,
+        _event: wl_shm_pool::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_buffer::WlBuffer,
+        _event: wl_buffer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtImageCaptureSourceV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCaptureSourceV1,
+        _event: <ExtImageCaptureSourceV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtOutputImageCaptureSourceManagerV1,
+        _event: <ExtOutputImageCaptureSourceManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCopyCaptureManagerV1,
+        _event: <ExtImageCopyCaptureManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
+                state.log.push("buffer_size");
+                state.size = Some((width, height));
+            }
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
+                state.log.push("shm_format");
+                if let Ok(format) = format.into_result() {
+                    state.formats.push(format);
+                }
+            }
+            ext_image_copy_capture_session_v1::Event::Done => {
+                state.log.push("session_done");
+                state.session_done = true;
+            }
+            ext_image_copy_capture_session_v1::Event::Stopped => {
+                state.log.push("session_stopped");
+                state.frame_failed.get_or_insert(0);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_image_copy_capture_frame_v1::Event::Transform { .. } => {
+                state.log.push("frame_transform");
+            }
+            ext_image_copy_capture_frame_v1::Event::Damage { .. } => {
+                state.log.push("frame_damage");
+            }
+            ext_image_copy_capture_frame_v1::Event::Ready => {
+                state.log.push("frame_ready");
+                state.frame_ready = true;
+            }
+            ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
+                state.log.push("frame_failed");
+                let code = reason.into_result().map(|r| r as u32).unwrap_or(u32::MAX);
+                state.frame_failed = Some(code);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Lists the outputs the compositor advertises, in registry order.
+pub fn outputs() -> Result<Vec<OutputInfo>> {
+    let (_conn, _queue, state) = connect()?;
+    Ok(state.outputs)
+}
+
+fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
+    let conn = Connection::connect_to_env().context("connect to WAYLAND_DISPLAY")?;
+    let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
+    let qh = queue.handle();
+
+    let registry = globals.registry().clone();
+    for global in globals.contents().clone_list() {
+        if global.interface == "wl_output" {
+            let _: wl_output::WlOutput =
+                registry.bind(global.name, global.version.min(4), &qh, ());
+        }
+    }
+
+    let mut state = State::default();
+    queue.roundtrip(&mut state).context("roundtrip for outputs")?;
+    Ok((conn, queue, state))
+}
+
+/// Captures `output_index`. Rows are returned top-down.
+pub fn capture(output_index: usize) -> Result<Shot> {
+    let conn = Connection::connect_to_env().context("connect to WAYLAND_DISPLAY")?;
+    let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
+    let qh = queue.handle();
+    let mut state = State::default();
+
+    let registry = globals.registry().clone();
+    let mut output_proxies = Vec::new();
+    for global in globals.contents().clone_list() {
+        if global.interface == "wl_output" {
+            let proxy: wl_output::WlOutput =
+                registry.bind(global.name, global.version.min(4), &qh, ());
+            output_proxies.push(proxy);
+        }
+    }
+    queue.roundtrip(&mut state).context("roundtrip for outputs")?;
+
+    if state.outputs.is_empty() {
+        bail!("compositor advertised no wl_output");
+    }
+    let target = state
+        .outputs
+        .get(output_index)
+        .with_context(|| {
+            format!(
+                "output index {output_index} out of range ({} outputs)",
+                state.outputs.len()
+            )
+        })?
+        .clone();
+    let output = output_proxies
+        .get(output_index)
+        .context("output proxy index out of range")?
+        .clone();
+
+    let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).context("bind wl_shm")?;
+    let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .context("bind ext_output_image_capture_source_manager_v1")?;
+    let capture_mgr: ExtImageCopyCaptureManagerV1 = globals
+        .bind(&qh, 1..=1, ())
+        .context("bind ext_image_copy_capture_manager_v1")?;
+
+    let source = source_mgr.create_source(&output, &qh, ());
+    let session = capture_mgr.create_session(&source, Options::empty(), &qh, ());
+
+    wait(&conn, &mut queue, &mut state, |s| {
+        s.session_done && s.size.is_some()
+    })
+    .context("waiting for capture session parameters")?;
+
+    if let Some(code) = state.frame_failed.take() {
+        bail!("capture session was stopped (reason {code})");
+    }
+
+    let (width, height) = state.size.context("session sent no buffer_size")?;
+    let format = pick_format(&state.formats)?;
+    let stride = width * 4;
+    let len = (stride as usize) * (height as usize);
+
+    let fd = memfd(len)?;
+    let pool = shm.create_pool(fd.as_fd(), len as i32, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        stride as i32,
+        format,
+        &qh,
+        (),
+    );
+
+    let frame = session.create_frame(&qh, ());
+    frame.attach_buffer(&buffer);
+    // Required on the first capture of a buffer: the compositor otherwise has
+    // no reason to consider the contents stale.
+    frame.damage_buffer(0, 0, width as i32, height as i32);
+    frame.capture();
+    conn.flush().context("flush capture request")?;
+
+    wait(&conn, &mut queue, &mut state, |s| {
+        s.frame_ready || s.frame_failed.is_some()
+    })
+    .context("waiting for captured frame")?;
+
+    if let Some(code) = state.frame_failed {
+        bail!("compositor failed the capture (reason {code})");
+    }
+
+    let rgba = read_frame(fd.as_fd(), len, width, height, format)?;
+
+    frame.destroy();
+    buffer.destroy();
+    pool.destroy();
+    session.destroy();
+    source.destroy();
+
+    Ok(Shot {
+        width,
+        height,
+        rgba,
+        output: target,
+    })
+}
+
+fn pick_format(formats: &[wl_shm::Format]) -> Result<wl_shm::Format> {
+    // COSMIC offers ABGR/XBGR8888 (byte order R,G,B,A) rather than the more
+    // common ARGB/XRGB. Prefer what it actually advertises.
+    for wanted in [
+        wl_shm::Format::Abgr8888,
+        wl_shm::Format::Xbgr8888,
+        wl_shm::Format::Argb8888,
+        wl_shm::Format::Xrgb8888,
+    ] {
+        if formats.contains(&wanted) {
+            return Ok(wanted);
+        }
+    }
+    bail!(
+        "compositor offered no usable shm format (got {:?})",
+        formats
+    )
+}
+
+/// Pumps the queue until `done` holds. Bounded so a silent compositor cannot
+/// hang the MCP server forever.
+fn wait(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    done: impl Fn(&State) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done(state) {
+        if Instant::now() > deadline {
+            bail!("timed out after 5s; events seen: {:?}", state.log);
+        }
+        queue
+            .roundtrip(state)
+            .context("roundtrip while waiting for capture")?;
+        conn.flush().ok();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Ok(())
+}
+
+fn memfd(len: usize) -> Result<OwnedFd> {
+    let name = CString::new("cosmic-desktop-mcp").context("CString")?;
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("memfd_create");
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let rc = unsafe { libc::ftruncate(fd, len as libc::off_t) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("ftruncate");
+    }
+    Ok(owned)
+}
+
+fn read_frame(
+    fd: std::os::fd::BorrowedFd<'_>,
+    len: usize,
+    width: u32,
+    height: u32,
+    format: wl_shm::Format,
+) -> Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+
+    let ptr = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error()).context("mmap captured buffer");
+    }
+
+    let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let mut rgba = Vec::with_capacity(len);
+    // Little-endian 32-bit words: ARGB8888 is B,G,R,A in memory, ABGR8888 is
+    // R,G,B,A. Handle both so the tool works on other compositors too.
+    match format {
+        wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888 => {
+            let opaque = format == wl_shm::Format::Xbgr8888;
+            for pixel in src.as_chunks::<4>().0 {
+                let alpha = if opaque { 0xff } else { pixel[3] };
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], alpha]);
+            }
+        }
+        _ => {
+            let opaque = format == wl_shm::Format::Xrgb8888;
+            for pixel in src.as_chunks::<4>().0 {
+                let alpha = if opaque { 0xff } else { pixel[3] };
+                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], alpha]);
+            }
+        }
+    }
+
+    unsafe {
+        libc::munmap(ptr, len);
+    }
+    let _ = (width, height);
+    Ok(rgba)
+}

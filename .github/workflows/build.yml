@@ -1,0 +1,27 @@
+name: Build cosmic-desktop-mcp
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      # --all-systems: the flake covers aarch64-linux too; without it nix
+      # reports "omitted these incompatible systems". Only evaluation happens
+      # for the foreign system, nothing is built.
+      - name: Evaluate flake
+        run: nix flake check --all-systems --accept-flake-config
+
+      # The cachix step above pushes every store path built here, so this
+      # doubles as the "make it substitutable" step — no artifact upload.
+      - name: Build
+        run: nix build .#default --accept-flake-config -L

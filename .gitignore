@@ -1,0 +1,8 @@
+target/
+result
+result-*
+
+# jj's bookkeeping dir (colocated mode). Nix hashes the working tree for
+# `src = ./.`, so leaving it visible would make local builds hash differently
+# from CI's clean checkout — and miss every cachix entry.
+.jj/

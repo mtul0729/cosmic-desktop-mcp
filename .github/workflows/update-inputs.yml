@@ -1,0 +1,62 @@
+name: Update flake inputs
+on:
+  schedule:
+    # Daily at 04:00 UTC
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: update-inputs
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Update inputs and build
+        run: |
+          cp flake.lock /tmp/flake.lock.old
+          nix flake update --accept-flake-config
+          nix flake check --all-systems --accept-flake-config
+          nix build .#packages.x86_64-linux.default --accept-flake-config -L
+
+      # Push directly: the build above is the gate, so a broken input is
+      # stopped here rather than landing on main. The paths just built are
+      # already in the mtul cache, so the build.yml run triggered by this push
+      # is a full hit.
+      - name: Commit and push flake.lock
+        run: |
+          if git diff --quiet -- flake.lock; then
+            echo "flake inputs already up to date"
+            exit 0
+          fi
+          changed=$(python3 - <<'EOF'
+          import json
+          old = json.load(open("/tmp/flake.lock.old"))
+          new = json.load(open("flake.lock"))
+          direct = new["nodes"]["root"]["inputs"].keys()
+          names = [
+              k
+              for k in direct
+              if old["nodes"].get(k, {}).get("locked", {}).get("rev")
+              != new["nodes"][k].get("locked", {}).get("rev")
+          ]
+          print(", ".join(sorted(names)) or "flake inputs")
+          EOF
+          )
+          nixpkgs=$(jq -r '.nodes.nixpkgs.locked.rev' flake.lock)
+          echo "updating: $changed (nixpkgs $nixpkgs)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add flake.lock
+          git commit -m "nix: update ${changed} (nixpkgs ${nixpkgs:0:9})"
+          git pull --rebase origin main
+          git push
