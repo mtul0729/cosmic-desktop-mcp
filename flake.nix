@@ -51,7 +51,7 @@
           cargoLock = ./Cargo.lock;
         };
 
-        package = craneLib.buildPackage {
+        package = (craneLib.buildPackage {
           pname = "cosmic-desktop-mcp";
           version = "0.1.0";
 
@@ -64,10 +64,6 @@
           # Clipboard support shells out to wl-copy/wl-paste rather than
           # reimplementing ext-data-control (see src/clipboard.rs).
           nativeBuildInputs = [ pkgs.makeWrapper ];
-          postFixup = ''
-            wrapProgram $out/bin/cosmic-desktop-mcp \
-              --prefix PATH : ${lib.makeBinPath [ pkgs.wl-clipboard ]}
-          '';
 
           separateDebugInfo = true;
 
@@ -78,7 +74,18 @@
             platforms = lib.platforms.linux;
             mainProgram = "cosmic-desktop-mcp";
           };
-        };
+        }).overrideAttrs (prev: {
+          # `buildPackage` derives the deps-only (`cargoArtifacts`) derivation
+          # from these same arguments, and crane only overrides its
+          # `installPhase` — any `postFixup` here lands in that derivation too,
+          # where `$out/bin` does not exist and `wrapProgram` aborts the build
+          # ("Cannot wrap ... because it does not exist"). Wrapping after the
+          # fact keeps it on the final package only.
+          postFixup = (prev.postFixup or "") + ''
+            wrapProgram $out/bin/cosmic-desktop-mcp \
+              --prefix PATH : ${lib.makeBinPath [ pkgs.wl-clipboard ]}
+          '';
+        });
       in
       {
         packages.default = package;
