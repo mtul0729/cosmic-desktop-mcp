@@ -53,8 +53,56 @@
 | `key` | 按组合键，如 `ctrl+s` | EIS |
 | `clipboard_write` | 写剪贴板（不粘贴） | wl-copy（来自 wl-clipboard） |
 | `clipboard_read` | 读剪贴板 | wl-paste |
+| `workspaces` | 列/切 workspace（group + name + 状态） | ext-workspace-manager |
+| `applets` | 列面板 applet 进程：名字 / PID / 父进程 / 内存 / 年龄 | /proc |
+| `restart_applet` | 刷新面板上的 applet（重写 `plugins_*` 配置） | cosmic-panel 配置文件 |
+| `app_logs` | 读某个 applet 的 journal 日志 | journalctl |
+| `config_read` | 读 cosmic-config 键（RON） | `~/.config/cosmic` |
+| `config_write` | 写/删 cosmic-config 键，返回旧值便于回滚 | `~/.config/cosmic` |
 
 坐标一律是**截图像素的坐标**，截图不缩放，所以不需要换算。
+
+## COSMIC 专用操作
+
+操纵桌面只是用途之一；调试 COSMIC 自己的应用、widgets 和 applets 是另一条主线。
+下面几条都是在这台机器（COSMIC 1.9.0）上实测的，决定了工具的形状。
+
+### applet 是进程，但 panel 不监督它
+
+每个 applet 都是独立进程，由 `cosmic-panel` 启动，两块屏各一套。`cosmic-panel` 源码里确实
+建了 launch-pad 的 `ProcessManager` 并设了 `RestartMode::ExponentialBackoff`，但**实测
+SIGTERM 之后 panel 不会把 applet 拉回来**，槽位就那么空着。
+
+唯一观测到有效的重启手段是**重写 panel 的 `plugins_*` 配置**：把列出该 applet 的键写成
+`None`，等 config watcher 看到，再把原文写回。panel 会重建整个 section，所以
+`restart_applet` 实际是「刷新面板」——同一面板上的 time / workspaces / audio 都会拿到新
+PID。工具无条件写回原文，备份放在 `~/.local/state/cosmic-desktop-mcp/panel-backups/`。
+
+```
+~/.config/cosmic/com.system76.CosmicPanel/v1/entries          -> ["Panel", "Dock"]
+~/.config/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_center
+~/.config/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings
+```
+
+### workspace 没有 id，而且每块屏一组
+
+`ext_workspace_manager_v1` 的 `id` 事件是协议要求必须发的，但 COSMIC 不发。所以 workspace
+只能用「group + name + 网格坐标」指认。又因为 workspace **按输出分组**，两块屏都有叫 `"1"`
+和 `"2"` 的 —— 名字歧义时必须显式给 `group`，工具会报错而不是猜哪块屏。group 只能按
+compositor 报告顺序编号：`workspace_enter` 给的 `wl_output` 代理在这里不带连接器名。
+
+### AT-SPI 拿不到 widget 树
+
+`at-spi2-registryd` 在跑，但 a11y 总线上只有它自己和 WorkBuddy 的 magpie，**没有任何 COSMIC
+应用注册**。libcosmic 的 accesskit 走 `cosmic_a11y_manager_v1`，不是 AT-SPI。所以「查某个
+applet 里有哪些按钮」对 COSMIC 是断的，widget 级调试只能是黑盒：截图 + 点击 + 日志。
+
+### 还缺一块：窗口几何
+
+标准协议不给窗口的屏幕位置（`ext_foreign_toplevel_list_v1` 只有 identifier/title/app_id），
+所以「按窗口截图 → 在窗口内定位控件 → 点击」这条链缺最后一步的全局坐标。位置只在 COSMIC
+私有的 `zcosmic_toplevel_info_v1` 里，那是下一步：自带 XML + `build.rs`，并在 flake 里额外
+保留 `*.xml`（`cleanCargoSource` 只留 `*.rs` / `*.toml`）。
 
 ## EIS 后端（实测通过）
 

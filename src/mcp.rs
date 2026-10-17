@@ -12,10 +12,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::applets;
 use crate::clipboard;
+use crate::config;
 use crate::input;
 use crate::keymap::Button;
-use crate::wl::{capture, toplevel};
+use crate::wl::{capture, toplevel, workspace};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -220,6 +222,101 @@ this server process.",
                 "properties": {"combo": {"type": "string"}},
                 "required": ["combo"]
             }
+        },
+        {
+            "name": "workspaces",
+            "description": "List COSMIC workspaces over ext_workspace_manager_v1: group (one per \
+output), name, grid position, and active / urgent / hidden state. COSMIC workspaces are per \
+output, so every group has its own \"1\", \"2\", ... Pass \"activate\" to switch, plus \"group\" \
+when the name exists on several outputs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "activate": {
+                        "type": "string",
+                        "description": "Workspace name (\"2\") or grid position (\"2,0\") to switch to. Omit to just list."
+                    },
+                    "group": {
+                        "type": "integer",
+                        "description": "Which output's workspace group (0-based, from the listing). Required when the name exists in several groups.",
+                        "minimum": 0
+                    }
+                }
+            }
+        },
+        {
+            "name": "applets",
+            "description": "List running COSMIC panel applets as processes: name, pid, parent, \
+memory and age. Every applet is a normal process supervised by cosmic-panel, so there is one \
+instance per panel (two monitors = two copies of each applet).",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "restart_applet",
+            "description": "Restart a panel applet by blanking and rewriting the cosmic-panel \
+plugins_* config entry that lists it. That is the only thing observed to make the panel respawn an \
+applet: a plain SIGTERM leaves the slot empty, because cosmic-panel does not supervise its applets \
+even though it builds a launch-pad ProcessManager. In practice the panel rebuilds every applet on \
+that section (time, workspaces and audio all get new pids), so treat this as a panel refresh. The \
+original config text is always written back, and a backup lands in \
+~/.local/state/cosmic-desktop-mcp/panel-backups/. Accepts a full name (cosmic-applet-time) or the \
+suffix (time).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Full applet name or suffix, e.g. \"cosmic-applet-time\" or \"time\"."
+                    }
+                },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "app_logs",
+            "description": "Recent stderr from one applet, straight out of the user journal \
+(journalctl -t <name>). Applets inherit the session's stderr, so this is where their warnings and \
+panics appear — the first place to look when a panel item misbehaves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Applet process name, e.g. cosmic-applet-time."},
+                    "lines": {"type": "integer", "description": "How many lines to return. Default 50, max 2000."}
+                },
+                "required": ["name"]
+            }
+        },
+        {
+            "name": "config_read",
+            "description": "Read cosmic-config entries. COSMIC stores one setting per file as raw \
+RON text under ~/.config/cosmic/<app-id>/v1/<key>. Omit \"app\" to list app ids; omit \"key\" to \
+dump every key of one app.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "App id, e.g. com.system76.CosmicAppletTime."},
+                    "key": {"type": "string", "description": "Setting name, e.g. military_time."}
+                }
+            }
+        },
+        {
+            "name": "config_write",
+            "description": "Write or delete one cosmic-config key. The value is RON written \
+verbatim, so strings keep their quotes and enums keep their variant names. Returns the previous \
+value, which makes the change reversible. COSMIC watches the config tree and most consumers react \
+immediately; applets that only read at startup need restart_applet afterwards.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string"},
+                    "key": {"type": "string"},
+                    "value": {
+                        "type": "string",
+                        "description": "RON text, e.g. true, 0 or \"Some(\\\"text\\\")\". Omit or null to delete the key."
+                    }
+                },
+                "required": ["app", "key"]
+            }
         }
     ])
 }
@@ -243,6 +340,12 @@ fn call_tool(params: Option<&Value>) -> Result<Value> {
         "clipboard_write" => tool_clipboard_write(&args),
         "clipboard_read" => tool_clipboard_read(),
         "key" => tool_key(&args),
+        "workspaces" => tool_workspaces(&args),
+        "applets" => tool_applets(),
+        "restart_applet" => tool_restart_applet(&args),
+        "app_logs" => tool_app_logs(&args),
+        "config_read" => tool_config_read(&args),
+        "config_write" => tool_config_write(&args),
         other => bail!("unknown tool {other:?}"),
     };
 
@@ -354,6 +457,88 @@ fn tool_env_info() -> Result<String> {
         "outputs": rows,
         "notes": notes,
     }))?)
+}
+
+fn tool_workspaces(args: &Value) -> Result<String> {
+    let list = match args.get("activate").and_then(Value::as_str) {
+        Some(target) => {
+            let group = args
+                .get("group")
+                .and_then(Value::as_u64)
+                .map(|index| index as usize);
+            workspace::activate(target, group)?
+        }
+        None => workspace::list()?,
+    };
+    let groups = list
+        .iter()
+        .map(|workspace| workspace.group)
+        .max()
+        .map(|max| max + 1)
+        .unwrap_or(0);
+    Ok(serde_json::to_string_pretty(&json!({
+        "count": list.len(),
+        "groups": groups,
+        "workspaces": list,
+        "note": "COSMIC does not send the protocol's mandatory `id` event, so a workspace is \
+                 identified by its group (one per output), name and grid position. Workspaces \
+                 are per output: each group has its own \"1\", \"2\", ...",
+    }))?)
+}
+
+fn tool_applets() -> Result<String> {
+    let applets = applets::list()?;
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for applet in &applets {
+        *counts.entry(applet.name.as_str()).or_default() += 1;
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "count": applets.len(),
+        "by_name": counts,
+        "applets": applets,
+    }))?)
+}
+
+fn tool_restart_applet(args: &Value) -> Result<String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .context("restart_applet needs \"name\"")?;
+    let restarted = applets::restart(name)?;
+    Ok(serde_json::to_string_pretty(&json!({
+        "restarted": restarted,
+        "note": "the panel respawned these from its plugins_* config, so the pids differ from the \
+                 processes that existed before; the config key was restored to its original text",
+    }))?)
+}
+
+fn tool_app_logs(args: &Value) -> Result<String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .context("app_logs needs \"name\"")?;
+    let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50) as usize;
+    applets::logs(name, lines)
+}
+
+fn tool_config_read(args: &Value) -> Result<String> {
+    let app = args.get("app").and_then(Value::as_str);
+    let key = args.get("key").and_then(Value::as_str);
+    Ok(serde_json::to_string_pretty(&config::read(app, key)?)?)
+}
+
+fn tool_config_write(args: &Value) -> Result<String> {
+    let app = args
+        .get("app")
+        .and_then(Value::as_str)
+        .context("config_write needs \"app\"")?;
+    let key = args
+        .get("key")
+        .and_then(Value::as_str)
+        .context("config_write needs \"key\"")?;
+    // A missing or null value means "delete this key".
+    let value = args.get("value").and_then(Value::as_str);
+    Ok(serde_json::to_string_pretty(&config::write(app, key, value)?)?)
 }
 
 fn tool_list_windows() -> Result<String> {

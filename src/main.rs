@@ -1,12 +1,17 @@
 //! MCP server for driving a COSMIC/Wayland desktop.
 //!
-//! Four layers, each using the protocol COSMIC actually implements:
+//! Each layer uses the protocol or mechanism COSMIC actually implements:
 //!   - `wl::capture`     ext_image_copy_capture_v1 + wl_shm
 //!   - `wl::toplevel`    ext_foreign_toplevel_list_v1
+//!   - `wl::workspace`   ext_workspace_manager_v1
 //!   - `input`           EIS/libei through the RemoteDesktop portal
 //!   - `keymap`          linux key/button codes (US layout)
+//!   - `applets`         panel applets as processes (panel supervises them)
+//!   - `config`          cosmic-config RON entries on disk
 
+mod applets;
 mod clipboard;
+mod config;
 mod eis;
 mod input;
 mod keymap;
