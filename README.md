@@ -20,7 +20,9 @@
 
 - **截图** — `ext_image_copy_capture_manager_v1`（staging），不需要对话框
 - **列窗口** — `ext_foreign_toplevel_list_v1`（staging），和 `lswt` 看到的是同一份数据
-- **键鼠** — 没有 `zwp_virtual_pointer_manager_v1`，只能走 `/dev/uinput`
+- **键鼠** — wayland 协议层没有 `zwp_virtual_pointer_manager_v1`，所以走 `/dev/uinput`
+  （`/dev/uinput` 是目前采用的路径，不是唯一可用的：portal 的 RemoteDesktop v2 暴露了
+  `ConnectToEIS` 和 `NotifyPointerButton`，也能注入输入，但需要授权流程，这里没有采用）
 
 ## 现状（2026-10-17 实测）
 
