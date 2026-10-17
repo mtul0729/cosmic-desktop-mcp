@@ -158,12 +158,21 @@ first, waits for the compositor to register the hover, then presses and releases
         },
         {
             "name": "type_text",
-            "description": "Type text into the focused window. ASCII is sent as keycodes; anything \
-else (Chinese, emoji, accented characters) is put on the clipboard and pasted with ctrl+v, so it \
-works in any text field that supports paste.",
+            "description": "Type text into the focused window. Default mode \"paste\" puts the text \
+on the clipboard and presses ctrl+v: this is the reliable path, because synthesized keycodes are \
+routed through the active input method and ASCII turns into pinyin candidates under fcitx5. Mode \
+\"keys\" injects keycodes instead (printable ASCII only) and is only correct when no input method \
+is active or real key events are wanted. Note that paste mode overwrites the clipboard.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"text": {"type": "string"}},
+                "properties": {
+                    "text": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["paste", "keys"],
+                        "description": "paste (default) uses the clipboard + ctrl+v; keys sends keycodes."
+                    }
+                },
                 "required": ["text"]
             }
         },
@@ -312,26 +321,44 @@ fn tool_type_text(args: &Value) -> Result<String> {
         .get("text")
         .and_then(Value::as_str)
         .context("missing text")?;
-
-    // Keycodes are US-layout ASCII only. Everything else has to travel as
-    // clipboard data and be pasted, which is also what a human would do.
-    let ascii = text
-        .chars()
-        .all(|c| c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\t');
-    if ascii {
-        device()?.type_text(text)?;
-        return Ok(format!("typed {} characters", text.chars().count()));
+    if text.is_empty() {
+        return Ok("nothing to type".to_string());
     }
 
-    clipboard::write(text)?;
-    // The compositor needs to see the new selection before the paste request,
-    // otherwise the target reads the previous contents.
-    std::thread::sleep(Duration::from_millis(120));
-    press_chord("ctrl+v")?;
-    Ok(format!(
-        "pasted {} characters via the clipboard (ctrl+v)",
-        text.chars().count()
-    ))
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("paste");
+    match mode {
+        // Keycodes go through the compositor's input pipeline, which hands
+        // them to whatever input method is active. With fcitx5 running, "abc"
+        // is treated as a pinyin syllable and commits as a Chinese candidate
+        // ("abc123" arrived as 按扁成23). So keycodes are opt-in, and only for
+        // callers that know the input method is off or that the target wants
+        // real key events.
+        "keys" => {
+            let keyable = text
+                .chars()
+                .all(|c| c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\t');
+            if !keyable {
+                bail!("mode=keys only accepts printable ASCII; use mode=paste for anything else");
+            }
+            device()?.type_text(text)?;
+            Ok(format!(
+                "typed {} characters as keycodes",
+                text.chars().count()
+            ))
+        }
+        "paste" => {
+            clipboard::write(text)?;
+            // The compositor needs to see the new selection before the paste
+            // request, otherwise the target reads the previous contents.
+            std::thread::sleep(Duration::from_millis(120));
+            press_chord("ctrl+v")?;
+            Ok(format!(
+                "pasted {} characters via the clipboard (ctrl+v); the clipboard now holds this text",
+                text.chars().count()
+            ))
+        }
+        other => bail!("unknown mode {other:?}; expected \"paste\" or \"keys\""),
+    }
 }
 
 fn tool_clipboard_write(args: &Value) -> Result<String> {

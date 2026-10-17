@@ -47,7 +47,7 @@
 | `click` | 按截图坐标点击（先移动、等悬停、再按下） | /dev/uinput |
 | `move` | 移动指针悬停 | /dev/uinput |
 | `scroll` | 滚轮 | /dev/uinput |
-| `type_text` | ASCII 走按键；**非 ASCII（中文等）自动走剪贴板 + ctrl+v** | uinput + wl-clipboard |
+| `type_text` | **一律走剪贴板 + ctrl+v**（默认）；`mode:"keys"` 才发 keycode | uinput + wl-clipboard |
 | `key` | 按组合键，如 `ctrl+s` | /dev/uinput |
 | `clipboard_write` | 写剪贴板（不粘贴） | wl-copy（来自 wl-clipboard） |
 | `clipboard_read` | 读剪贴板 | wl-paste |
@@ -71,6 +71,10 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
 
 - region 是**逻辑坐标**下完整的桌面拼图（2560x1440 的屏在 scale 1.25 下就是 2048x1152），
   多屏是一张连续坐标系，`--eis-click 1024 8` 实测正好点在面板时钟上，日历弹窗打开。
+- **EIS 点击不转移键盘焦点**（2026-10-17 实测）：点击落在哪个窗口，键盘焦点都不动。
+  所以「点一下输入框再打字」不管用，除非焦点本来就那个窗口——paste 进不去框的原因
+  就是它。另一个后果：`key` / `type_text` 发出的按键去的是**当前焦点窗口**，不一定是
+  刚点过的那个。
 - 授权用 `PersistMode::ExplicitlyRevoked`，restore token 存在
   `$XDG_STATE_HOME/cosmic-desktop-mcp/restore-token`；之后每次连接**静默通过**，
   不再弹框。token 能注入输入，别把它提交进任何仓库。
@@ -84,8 +88,10 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
 ## 已知限制
 
 1. **拿不到窗口状态**。`ext-foreign-toplevel-list` 协议本身不带 focused / minimized / geometry，只有 `wlr-foreign-toplevel-management` 带，而 COSMIC 没实现它。所以 `list_windows` 只能告诉你「有哪些窗口」，不能告诉你「焦点在哪」——那个要靠截图看。
-2. **`type_text` 的中文路径已经打通**。按键只能表达 US 布局 ASCII，所以非 ASCII 内容自动改为
-   写剪贴板再 ctrl+v；剪贴板由 wl-clipboard 提供（打包时自动带进 PATH，无需手装）。
+2. **`type_text` 一律走剪贴板**。合成 keycode 会先进输入法：fcitx5 在中文模式下把
+   `abc123` 吃成「按扁成23」，单个 `z` 也会弹候选栏。所以按键路径是 `mode:"keys"`
+   显式指定才走，且只收可打印 ASCII——只适合输入法关着、或确实需要真实按键事件的场景。
+   剪贴板由 wl-clipboard 提供（打包时自动带进 PATH，无需手装）。
    已实测：`clipboard_write` 中文读回一致，且同时提供 XWayland 兼容的
    `TEXT`/`STRING`/`UTF8_STRING` 类型，Chrome/Electron 应用可粘贴。
    一个特性：Wayland 选区跟着持有进程走，MCP server 退出后剪贴板内容就没了。

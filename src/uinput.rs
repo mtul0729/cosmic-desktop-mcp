@@ -10,7 +10,7 @@
 //! The ioctl numbers are stable kernel ABI (`linux/uinput.h`), so this is
 //! hand-rolled rather than pulling in a bindings crate.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
@@ -120,7 +120,10 @@ struct InputEvent {
 }
 
 pub struct Device {
-    fd: RawFd,
+    // Owning the `File` matters: dropping it closes the fd, and the number
+    // gets reused by the next `open(2)` in this process (often the clipboard
+    // child), which would make event writes land somewhere random.
+    file: File,
     width: i32,
     height: i32,
 }
@@ -205,7 +208,7 @@ impl Device {
         std::thread::sleep(Duration::from_millis(300));
 
         Ok(Self {
-            fd,
+            file,
             width,
             height,
         })
@@ -226,9 +229,9 @@ impl Device {
             };
             buf.extend_from_slice(bytes);
         }
-        // `File` is borrowed for the fd only; writing through libc keeps the
-        // struct bytes exactly as the kernel expects them.
-        let written = unsafe { libc::write(self.fd, buf.as_ptr() as *const _, buf.len()) };
+        let written = unsafe {
+            libc::write(self.file.as_raw_fd(), buf.as_ptr() as *const _, buf.len())
+        };
         if written < 0 {
             return Err(std::io::Error::last_os_error()).context("write input_event");
         }
@@ -311,7 +314,7 @@ impl Device {
 impl Drop for Device {
     fn drop(&mut self) {
         unsafe {
-            libc::ioctl(self.fd, UI_DEV_DESTROY as _);
+            libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY as _);
         }
     }
 }
