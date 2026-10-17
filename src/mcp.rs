@@ -791,10 +791,10 @@ fn tool_type_text(args: &Value) -> Result<String> {
     match mode {
         // Keycodes go through the compositor's input pipeline, which hands
         // them to whatever input method is active. With fcitx5 running, "abc"
-        // is treated as a pinyin syllable and commits as a Chinese candidate
-        // ("abc123" arrived as 按扁成23). So keycodes are opt-in, and only for
-        // callers that know the input method is off or that the target wants
-        // real key events.
+        // is treated as a pinyin syllable and commits as a Chinese candidate:
+        // "abc123" arrived as Chinese characters followed by "23". So keycodes
+        // are opt-in, and only for callers that know the input method is off or
+        // that the target wants real key events.
         "keys" => {
             let keyable = text
                 .chars()
