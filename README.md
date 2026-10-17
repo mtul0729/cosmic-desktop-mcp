@@ -89,6 +89,8 @@ eis:   interfaces pointer_absolute=true button=true keyboard=false
 - 滚动是用自建可控窗口验证的：`kitty -o font_size=26 sh -c 'seq 1 300; exec sleep 900'`，
   内容带行号，向上滚 3 格视口从 295–300 变成 280–300，向下 15 格精确回底。
   面板时钟那种目标不可靠——它可能压根不响应滚轮。
+  新窗口会开在**焦点屏**上（COSMIC 当前的默认行为，没有规范保证），所以两块 output
+  都要截图找窗口；要它落在指定屏，先点一下那块屏。
 
 MCP 工具层在 2026-10-17 已切到 EIS：`src/input.rs` 做后端分发，默认 EIS，
 EIS 会话常驻（`EiEvent` 不是 `Send`，独占一个线程 + 通道注入命令），
