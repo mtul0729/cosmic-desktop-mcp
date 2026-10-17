@@ -111,6 +111,39 @@ EIS 会话常驻（`EiEvent` 不是 `Send`，独占一个线程 + 通道注入�
 4. **`key` 的键位表是 US 布局**。事件进合成器的输入管线，由它套布局，而布局问不到；
    非 US 布局请走剪贴板。
 
+## 为什么手写 MCP 协议层，而不是用 SDK
+
+`src/mcp.rs` 的协议层是手写的，约 60 行：stdin 逐行读、解析 JSON-RPC、按 `method` 分发、
+逐行写回。只实现 `initialize` / `ping` / `tools/list` / `tools/call`。
+
+理由是依赖体量：官方 Rust SDK `rmcp`（v3.5.1，2026-03 出 1.0，支持规范 2026-07-28）
+自带 tokio 运行时抽象和 schemars，会让 crane 的 `cargoArtifacts` 哈希显著变重，
+而工具还在快速迭代期，缓存复用率会掉。
+
+**代价是真实的**，不是「反正够用」：
+
+| 缺什么 | 后果 |
+|---|---|
+| `protocolVersion` 钉在 `2024-11-05` | 新客户端会降级协商；`server/discover`、长任务、订阅都没有 |
+| 无 progress notification | 截图、等 portal 授权时客户端看不到任何进度 |
+| 无 cancellation | 调用发出去取消不了（EIS 首次授权有 60s 超时） |
+| schema 手写 | 与实现分开维护；`scroll` 的 `dy` 描述就曾和实现相反 |
+
+**什么时候该换成 `rmcp`**——出现任意一条就不再省：
+
+1. 需要 progress 反馈（批量截图、等授权这类长任务）
+2. 需要 cancellation
+3. 要同时服务多个客户端
+4. 要 streamable HTTP 传输
+5. 工具继续变多，手写 schema 不划算
+
+**迁移路径**，不必一步到位：
+
+1. 先把工具 schema 改成从 Rust 结构体 derive（自己引 `schemars`，不引 rmcp），
+   根除 schema 漂移——`dy` 那次就是它导致的。
+2. 真需要 progress / 长任务 / HTTP 时再整体换 `rmcp` 的 `#[tool]` + `ServerHandler`；
+   `dispatch()` 里那些 `tool_*` 函数的签名基本能原样搬过去。
+
 ## 安装
 
 ```bash
