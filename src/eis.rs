@@ -29,7 +29,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use ashpd::desktop::remote_desktop::{
     ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
 };
@@ -98,10 +98,10 @@ static SESSION: OnceLock<Mutex<Option<Session>>> = OnceLock::new();
 pub fn session() -> Result<Session> {
     let slot = SESSION.get_or_init(|| Mutex::new(None));
     let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = guard.as_ref() {
-        if existing.is_alive() {
-            return Ok(existing.clone());
-        }
+    if let Some(existing) = guard.as_ref()
+        && existing.is_alive()
+    {
+        return Ok(existing.clone());
     }
     let fresh = Session::open()?;
     *guard = Some(fresh.clone());
@@ -307,7 +307,10 @@ fn with_frame(live: &Live, build: impl FnOnce()) {
 fn run(ready: Sender<Result<Session>>, alive: Arc<AtomicBool>) {
     let mut ready = Some(ready);
 
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(err) => {
             fail(ready, alive, anyhow::anyhow!("start async runtime: {err}"));
@@ -323,14 +326,15 @@ fn run(ready: Sender<Result<Session>>, alive: Arc<AtomicBool>) {
         }
     };
 
-    let (connection, events) =
-        match context.handshake_blocking("cosmic-desktop-mcp", ei::handshake::ContextType::Sender) {
-            Ok(pair) => pair,
-            Err(err) => {
-                fail(ready, alive, anyhow::anyhow!("EIS handshake: {err}"));
-                return;
-            }
-        };
+    let (connection, events) = match context
+        .handshake_blocking("cosmic-desktop-mcp", ei::handshake::ContextType::Sender)
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            fail(ready, alive, anyhow::anyhow!("EIS handshake: {err}"));
+            return;
+        }
+    };
 
     let state = Arc::new(Mutex::new(State::default()));
     let started = Instant::now();
@@ -345,7 +349,9 @@ fn run(ready: Sender<Result<Session>>, alive: Arc<AtomicBool>) {
         };
 
         {
-            let mut guard = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !handle(&mut guard, event) {
                 alive.store(false, Ordering::Relaxed);
                 return;
@@ -383,7 +389,9 @@ fn run(ready: Sender<Result<Session>>, alive: Arc<AtomicBool>) {
     }
 
     if let Some(tx) = ready.take() {
-        let _ = tx.send(Err(anyhow::anyhow!("the EIS session closed before any device appeared")));
+        let _ = tx.send(Err(anyhow::anyhow!(
+            "the EIS session closed before any device appeared"
+        )));
     }
     alive.store(false, Ordering::Relaxed);
 }
@@ -507,7 +515,9 @@ async fn open_session() -> Result<ei::Context> {
 fn token_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
     Some(base.join("cosmic-desktop-mcp/restore-token"))
 }
 
@@ -520,10 +530,10 @@ fn load_token() -> Option<String> {
 
 fn store_token(token: &str) {
     let Some(path) = token_path() else { return };
-    if let Some(dir) = path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
+    if let Some(dir) = path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return;
     }
     let _ = std::fs::write(&path, token);
 }

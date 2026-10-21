@@ -265,13 +265,14 @@ fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
     let registry = globals.registry().clone();
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" {
-            let _: wl_output::WlOutput =
-                registry.bind(global.name, global.version.min(4), &qh, ());
+            let _: wl_output::WlOutput = registry.bind(global.name, global.version.min(4), &qh, ());
         }
     }
 
     let mut state = State::default();
-    queue.roundtrip(&mut state).context("roundtrip for outputs")?;
+    queue
+        .roundtrip(&mut state)
+        .context("roundtrip for outputs")?;
     Ok((conn, queue, state))
 }
 
@@ -291,7 +292,9 @@ pub fn capture(output_index: usize) -> Result<Shot> {
             output_proxies.push(proxy);
         }
     }
-    queue.roundtrip(&mut state).context("roundtrip for outputs")?;
+    queue
+        .roundtrip(&mut state)
+        .context("roundtrip for outputs")?;
 
     if state.outputs.is_empty() {
         bail!("compositor advertised no wl_output");

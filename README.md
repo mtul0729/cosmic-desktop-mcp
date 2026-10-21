@@ -32,16 +32,16 @@ Measured: `cosmic-comp 1.9.0` exposes 62 Wayland globals, and three of them are 
   both multiple monitors and mixed scaling wrong. Removed wholesale on 2026-10-17; there
   is no fallback switch.
 
-## Status (measured 2026-10-17)
+## Status (measured 2026-10-17, pointer/workspace surface extended 2026-10-22)
 
 | Capability | Status |
 |---|---|
-| `list_windows` | ✅ works, with state and geometry (see "Window geometry" for the measurements) |
-| `screenshot_window` | ✅ works; the crop is exact at DP-2's 1.25 scale. An occluded window needs `activate` first |
+| `list_windows` | ✅ works, with state, geometry and workspace membership (see "Window geometry" for the measurements) |
+| `screenshot_window` | ✅ works; the crop is exact at DP-2's 1.25 scale, and the response carries the same geometry fields as `list_windows`. An occluded window needs `activate` first |
 | `window_action` | ✅ activate/close/maximize/minimize/fullscreen all take effect; the state array follows |
-| Pointer and keyboard (`click` / `move` / `scroll` / `type_text` / `key`) | ✅ over EIS (libei), no `/dev/uinput` needed |
+| Pointer and keyboard (`click` / `move` / `scroll` / `click_window` / `move_window` / `scroll_window` / `type_text` / `key`) | ✅ over EIS (libei), no `/dev/uinput` needed. Every pointer call reports the output used and the window under the point |
 | Scroll direction | ✅ measured: positive `dy` scrolls up, negative down (the `REL_WHEEL` convention) |
-| `screenshot` | ✅ works, colours and orientation correct |
+| `screenshot` | ✅ works, colours and orientation correct; reports `screen_locked` from logind so a greeter frame is not mistaken for the desktop |
 
 **One behaviour worth knowing:** while the screen is locked (cosmic-greeter running),
 COSMIC suspends capture — `create_session` succeeds, but `capture()` on a frame never
@@ -54,14 +54,17 @@ locked.
 
 | Tool | What it does | Built on |
 |---|---|---|
-| `screenshot` | Capture one output, save a PNG, return the path | ext-image-copy-capture + wl_shm |
+| `screenshot` | Capture one output, save a PNG, return the path and `screen_locked` | ext-image-copy-capture + wl_shm |
 | `env_info` | Desktop topology + input backend status (no side effects, opens no EIS session) | wl_output + EIS region |
-| `list_windows` | Window list + state + **geometry** (`logical` and screenshot-pixel coordinates) | ext-foreign-toplevel-list + zcosmic-toplevel-info |
-| `screenshot_window` | Find the window's output, capture it, crop the window, return the in-image origin | capture + zcosmic-toplevel-info + EIS region |
+| `list_windows` | Window list + state + **geometry** (`logical` and screenshot-pixel coordinates) + workspace membership | ext-foreign-toplevel-list + zcosmic-toplevel-info |
+| `screenshot_window` | Find the window's output, capture it, crop the window, return its geometry in all three spaces | capture + zcosmic-toplevel-info + EIS region |
 | `window_action` | activate / close / maximize / minimize / fullscreen and friends | zcosmic-toplevel-manager |
-| `click` | Click at screenshot coordinates (move, wait for hover, then press) | EIS |
-| `move` | Hover the pointer | EIS |
-| `scroll` | Wheel; positive `dy` up, negative down | EIS |
+| `click` | Click at **output screenshot** coordinates; reports the output used and the window under the point | EIS |
+| `move` | Hover at output screenshot coordinates | EIS |
+| `scroll` | Wheel at output screenshot coordinates; positive `dy` up, negative down | EIS |
+| `click_window` | Click at **window image** coordinates; resolves the window's output and crop origin itself | EIS + zcosmic-toplevel-info |
+| `move_window` | Hover at window image coordinates | EIS + zcosmic-toplevel-info |
+| `scroll_window` | Wheel at window image coordinates | EIS + zcosmic-toplevel-info |
 | `type_text` | **Clipboard + ctrl+v by default**; `mode:"keys"` sends keycodes instead | wl-clipboard + EIS |
 | `key` | Chord such as `ctrl+s` | EIS |
 | `clipboard_write` | Put text on the clipboard without pasting | wl-copy (from wl-clipboard) |
@@ -73,8 +76,41 @@ locked.
 | `config_read` | Read a cosmic-config key (RON) | `~/.config/cosmic` |
 | `config_write` | Write or delete a cosmic-config key, returning the old value for rollback | `~/.config/cosmic` |
 
-Coordinates are **screenshot pixels** throughout. Screenshots are not scaled, so there is
-nothing to convert.
+## Coordinate spaces
+
+Three spaces appear in responses, and mixing them is the most expensive mistake this server
+can make. It happened: a window on output 1 had a crop origin of (966,60) in that output's
+screenshot, the caller added it to a window-image point and called `click`, which defaults
+to output 0. Every click landed on the other monitor while the tool answered "clicked ... on
+output 0". It cost an hour.
+
+| Space | Where it comes from | Who accepts it |
+|---|---|---|
+| **logical** | The compositor's desktop coordinates. A window's `logical` rect is relative to its output; EIS absolute input uses desktop-wide logical coordinates. | No MCP tool. `--eis-click` takes it. Everything else converts for you. |
+| **output screenshot pixels** | The PNG from `screenshot {output}`, at that output's physical resolution. | `click` / `move` / `scroll`, with the **same** `output` index. |
+| **window image pixels** | The PNG from `screenshot_window {window}`, a crop of the output at the window's origin. | `click_window` / `move_window` / `scroll_window`. |
+
+The conversions are:
+
+- window image -> output screenshot: add the crop `origin`
+- output screenshot -> logical: divide by the output's real scale (from the EIS region,
+  never `wl_output.scale`) and add the region's logical origin
+
+`click` defaults to output 0 and **does not infer the output from x/y**. If the point came
+from `screenshot_window`, use `click_window`: it resolves the window's output and crop origin
+internally, so there is no output index to get wrong and no arithmetic to do. That is the
+rule, not a convenience.
+
+Every pointer call now reports what it actually did: the output used, the logical point, and
+the window under the point (or null for the desktop), plus the workspace visibility of that
+window. When the point is empty on the requested output but falls inside a window on another
+output, the reply carries `other_output_match` with a warning — the exact signature of the
+output-index mistake.
+
+Window image pixels are a crop of the output screenshot, not the client's surface buffer:
+COSMIC's composited output is what the capture protocol returns, so the window image has the
+output's scale. `screenshot_window` reports `scale`, `logical`, `pixels` and `origin`, which
+is everything needed to see that without joining it to `list_windows`.
 
 The **workflow** an agent needs (run `env_info` first, `activate` before typing, never
 `kill` an applet — the ordering rules and the traps) is deliberately not in the tool
@@ -157,6 +193,15 @@ only in COSMIC's private `zcosmic_toplevel_info_v1` (v2+). Measurements:
   `window_action activate` really does move focus — which closes the "EIS clicks do not
   move keyboard focus" gap: click, then activate, then `type_text` lands in the window you
   just clicked.
+- **Workspace membership exists, but only at v3.** `zcosmic_toplevel_handle_v1` v3 adds
+  `ext_workspace_enter` / `ext_workspace_leave`, carrying the standard
+  `ext_workspace_handle_v1` objects. Joined against `ext_workspace_manager_v1` in the same
+  connection, they give the group, name and `active` flag that `list_windows` reports. The
+  group's `output_enter` event resolves to the `wl_output` connector name, so a window's
+  workspace can be tied to the same output index its geometry uses. Bound at v2 (or without
+  the workspace manager) the fields are `null` and the reply says why, rather than
+  pretending the window is on no workspace. Verified live: a window on eDP-1 reports
+  `{"group":0,"name":"1","active":true,"outputs":["eDP-1"]}`.
 
 ## The EIS backend (verified)
 
@@ -225,8 +270,12 @@ channel), the key table lives in `src/keymap.rs`, and `/dev/uinput` is gone enti
    (verified), then `type_text`.
 3. **Geometry is the last reported position, not visibility.** When a window is covered
    (fullscreen video) or on another workspace, cropping by its coordinates returns
-   whatever pixels are actually in that area. For real content, `window_action activate`
-   first.
+   whatever pixels are actually in that area. `list_windows` now reports
+   `on_active_workspace` (and the workspace group/name) so the second case is visible
+   before you click, and `click_window` warns when the target is not on the active
+   workspace. For the first case, `window_action activate` first. Stacking order is not
+   exposed, so a hit test with several overlapping candidates says it is ambiguous instead
+   of picking one.
 4. **`key`'s key table assumes a US layout.** Events enter the compositor's input pipeline
    and it applies the layout, which cannot be queried; for non-US layouts, use the
    clipboard.

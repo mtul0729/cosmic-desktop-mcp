@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 
 use crate::eis;
 use crate::keymap::{self, Button};
@@ -25,14 +25,17 @@ pub fn describe() -> Result<String> {
     ))
 }
 
-/// Moves the pointer. `x`/`y` are pixels in the screenshot of `output`.
-pub fn move_to(x: i32, y: i32, output: usize) -> Result<()> {
-    let (lx, ly) = logical(x, y, output)?;
-    eis::session()?.move_to(lx, ly)
+/// Moves the pointer to a logical desktop coordinate.
+///
+/// The tool layer resolves either an output screenshot pixel or a window image
+/// pixel into this space first; keeping the EIS calls in logical coordinates
+/// means there is exactly one place where the conversion can be wrong.
+pub fn move_logical(x: f64, y: f64) -> Result<()> {
+    eis::session()?.move_to(x, y)
 }
 
-pub fn click(button: Button, x: i32, y: i32, output: usize, count: u32) -> Result<()> {
-    move_to(x, y, output)?;
+pub fn click_logical(button: Button, lx: f64, ly: f64, count: u32) -> Result<()> {
+    move_logical(lx, ly)?;
     // A press that lands during the move is read as the end of a drag; the
     // compositor needs to see a settled hover first.
     std::thread::sleep(Duration::from_millis(250));
@@ -48,8 +51,8 @@ pub fn click(button: Button, x: i32, y: i32, output: usize, count: u32) -> Resul
     Ok(())
 }
 
-pub fn scroll(x: i32, y: i32, output: usize, dx: i32, dy: i32) -> Result<()> {
-    move_to(x, y, output)?;
+pub fn scroll_logical(lx: f64, ly: f64, dx: i32, dy: i32) -> Result<()> {
+    move_logical(lx, ly)?;
     std::thread::sleep(Duration::from_millis(150));
 
     // EIS scroll axes follow the touchpad convention: positive y is down, while
@@ -79,8 +82,8 @@ pub fn chord(combo: &str) -> Result<()> {
 /// see the note in `tool_type_text`.
 pub fn type_keys(text: &str) -> Result<()> {
     for ch in text.chars() {
-        let (code, shift) =
-            keymap::keycode_for(ch).with_context(|| format!("character {ch:?} needs an input method"))?;
+        let (code, shift) = keymap::keycode_for(ch)
+            .with_context(|| format!("character {ch:?} needs an input method"))?;
         if shift {
             key(keymap::KEY_LEFTSHIFT, true)?;
         }
@@ -95,26 +98,6 @@ pub fn type_keys(text: &str) -> Result<()> {
 
 fn set_button(button: Button, pressed: bool) -> Result<()> {
     eis::session()?.button(u32::from(button.code()), pressed)
-}
-
-/// Maps a screenshot pixel of `output` to a logical desktop coordinate.
-///
-/// The two spaces are not interchangeable: a screenshot measures physical
-/// pixels, EIS speaks logical ones. `wl_output.scale` cannot be used for the
-/// conversion — COSMIC reports 2 there regardless of the real factor — so the
-/// region's own scale is the only correct source.
-fn logical(x: i32, y: i32, output: usize) -> Result<(f64, f64)> {
-    let out = outputs()?
-        .into_iter()
-        .nth(output)
-        .with_context(|| format!("no output #{output}"))?;
-    let session = eis::session()?;
-    let matched = region_for(&out, &session.regions())?;
-    let region = matched.region;
-    Ok((
-        region.x + f64::from(x) / region.scale,
-        region.y + f64::from(y) / region.scale,
-    ))
 }
 
 /// An EIS region and how it was tied to a `wl_output`.
@@ -134,16 +117,15 @@ pub struct RegionMatch {
 /// same-sized regions, which made `output: 1` clicks land silently on output 0
 /// with two identical monitors.
 pub fn region_for(out: &capture::OutputInfo, regions: &[eis::Region]) -> Result<RegionMatch> {
-    if let Some(name) = out.name.as_deref() {
-        if let Some(region) = regions
+    if let Some(name) = out.name.as_deref()
+        && let Some(region) = regions
             .iter()
             .find(|region| region.mapping_id.as_deref() == Some(name))
-        {
-            return Ok(RegionMatch {
-                region: region.clone(),
-                by: "name",
-            });
-        }
+    {
+        return Ok(RegionMatch {
+            region: region.clone(),
+            by: "name",
+        });
     }
 
     let same_size: Vec<&eis::Region> = regions
@@ -181,36 +163,6 @@ pub fn region_for(out: &capture::OutputInfo, regions: &[eis::Region]) -> Result<
 /// place. A fresh roundtrip costs about a millisecond.
 pub fn outputs() -> Result<Vec<capture::OutputInfo>> {
     capture::outputs().context("enumerate outputs")
-}
-
-/// Converts a rect that the compositor reported relative to `output` (logical
-/// coordinates) into that output's screenshot pixel space.
-///
-/// Same scale problem as `logical()`, same answer: the EIS region's scale is
-/// the only trustworthy source. The region's origin cancels out — the
-/// compositor's window geometry is already relative to the output, and so is a
-/// screenshot — so only the multiplication remains.
-pub fn to_pixels(rect: crate::wl::toplevel::Rect, output: usize) -> Result<crate::wl::toplevel::Rect> {
-    let out = outputs()?
-        .into_iter()
-        .nth(output)
-        .with_context(|| format!("no output #{output}"))?;
-    let session = eis::session()?;
-    let scale = region_for(&out, &session.regions())?.region.scale;
-    Ok(scale_rect(rect, scale))
-}
-
-/// Multiplies a logical rect by `scale`. Pure, so callers that must not open
-/// an EIS session (anything status-like) can do the conversion from a region
-/// they already have.
-pub fn scale_rect(rect: crate::wl::toplevel::Rect, scale: f64) -> crate::wl::toplevel::Rect {
-    let scaled = |value: i32| (f64::from(value) * scale).round() as i32;
-    crate::wl::toplevel::Rect {
-        x: scaled(rect.x),
-        y: scaled(rect.y),
-        width: scaled(rect.width),
-        height: scaled(rect.height),
-    }
 }
 
 #[cfg(test)]

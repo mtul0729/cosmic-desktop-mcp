@@ -12,9 +12,11 @@
 mod applets;
 mod clipboard;
 mod config;
+mod coords;
 mod eis;
 mod input;
 mod keymap;
+mod lockstate;
 mod mcp;
 mod wl;
 

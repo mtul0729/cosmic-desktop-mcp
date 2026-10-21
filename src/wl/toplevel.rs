@@ -34,13 +34,20 @@ use cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_
 };
 use serde::Serialize;
 use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, backend::ObjectId, event_created_child,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
+    backend::ObjectId,
+    event_created_child,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{wl_output, wl_registry, wl_seat},
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
     ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+};
+use wayland_protocols::ext::workspace::v1::client::{
+    ext_workspace_group_handle_v1::{self, ExtWorkspaceGroupHandleV1},
+    ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1, State as WsState},
+    ext_workspace_manager_v1::{self, ExtWorkspaceManagerV1},
 };
 
 /// A rectangle in compositor (logical) coordinates, relative to an output.
@@ -50,6 +57,23 @@ pub struct Rect {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+/// One workspace a window is on, joined from `ext_workspace_enter` (since
+/// zcosmic_toplevel_info_v1 v3) and `ext_workspace_manager_v1`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct WindowWorkspace {
+    /// Index of the workspace group (one per output), in compositor order.
+    pub group: usize,
+    pub name: Option<String>,
+    /// Grid position as reported; COSMIC sends one number.
+    pub coordinates: Vec<u32>,
+    /// This workspace is the one the group currently shows.
+    pub active: bool,
+    pub hidden: bool,
+    /// Connector names of the group's outputs, when the compositor reported
+    /// them. Empty is "unknown", not "no output".
+    pub outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -64,6 +88,13 @@ pub struct Window {
     /// Placement in logical coordinates. `None` until the compositor has sent
     /// a `geometry` event.
     pub logical: Option<Rect>,
+    /// Workspaces the window is on. `None` means the compositor did not expose
+    /// membership (zcosmic_toplevel_info_v1 below v3, or no
+    /// ext_workspace_manager_v1), not that it is on none.
+    pub workspaces: Option<Vec<WindowWorkspace>>,
+    /// Whether one of those workspaces is the active one. `None` for the same
+    /// reason as `workspaces`.
+    pub on_active_workspace: Option<bool>,
 }
 
 /// What `action` may ask the compositor to do. The compositor is always free
@@ -130,6 +161,25 @@ struct State {
     /// at the end because `wl_output.name` may still be in flight.
     geometry: HashMap<ObjectId, Vec<(ObjectId, Rect)>>,
     capabilities: Vec<u32>,
+    /// Version negotiated for zcosmic_toplevel_info_v1. `ext_workspace_enter`
+    /// only exists at v3.
+    info_version: u32,
+    /// Whether ext_workspace_manager_v1 was bound. Without it the workspace
+    /// object ids a window reports cannot be named.
+    workspace_protocol: bool,
+    /// Group handles in compositor order; the index is the group number the
+    /// tools report.
+    group_order: Vec<ObjectId>,
+    /// Workspace id -> its group id.
+    workspace_group: HashMap<ObjectId, ObjectId>,
+    /// Group id -> the workspaces that entered it.
+    group_members: HashMap<ObjectId, Vec<ObjectId>>,
+    /// Group id -> the wl_output ids that entered it.
+    group_outputs: HashMap<ObjectId, Vec<ObjectId>>,
+    /// Workspace id -> its properties.
+    workspaces: HashMap<ObjectId, WindowWorkspace>,
+    /// cosmic handle id -> workspace ids from ext_workspace_enter/leave.
+    window_workspaces: HashMap<ObjectId, Vec<ObjectId>>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -168,6 +218,109 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<ExtWorkspaceManagerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtWorkspaceManagerV1,
+        event: ext_workspace_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let ext_workspace_manager_v1::Event::WorkspaceGroup { workspace_group } = event {
+            let id = workspace_group.id();
+            if !state.group_order.contains(&id) {
+                state.group_order.push(id);
+            }
+        }
+    }
+
+    event_created_child!(State, ExtWorkspaceManagerV1, [
+        ext_workspace_manager_v1::EVT_WORKSPACE_GROUP_OPCODE => (ExtWorkspaceGroupHandleV1, ()),
+        ext_workspace_manager_v1::EVT_WORKSPACE_OPCODE => (ExtWorkspaceHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtWorkspaceGroupHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtWorkspaceGroupHandleV1,
+        event: ext_workspace_group_handle_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_workspace_group_handle_v1::Event::OutputEnter { output } => {
+                let outputs = state.group_outputs.entry(proxy.id()).or_default();
+                if !outputs.contains(&output.id()) {
+                    outputs.push(output.id());
+                }
+            }
+            ext_workspace_group_handle_v1::Event::OutputLeave { output } => {
+                if let Some(outputs) = state.group_outputs.get_mut(&proxy.id()) {
+                    outputs.retain(|id| *id != output.id());
+                }
+            }
+            ext_workspace_group_handle_v1::Event::WorkspaceEnter { workspace } => {
+                let members = state.group_members.entry(proxy.id()).or_default();
+                if !members.contains(&workspace.id()) {
+                    members.push(workspace.id());
+                }
+                state.workspace_group.insert(workspace.id(), proxy.id());
+            }
+            ext_workspace_group_handle_v1::Event::WorkspaceLeave { workspace } => {
+                if let Some(members) = state.group_members.get_mut(&proxy.id()) {
+                    members.retain(|id| *id != workspace.id());
+                }
+                state.workspace_group.remove(&workspace.id());
+            }
+            ext_workspace_group_handle_v1::Event::Removed => {
+                state.group_members.remove(&proxy.id());
+                state.group_outputs.remove(&proxy.id());
+                state.group_order.retain(|id| *id != proxy.id());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtWorkspaceHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtWorkspaceHandleV1,
+        event: ext_workspace_handle_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let entry = state.workspaces.entry(proxy.id()).or_default();
+        match event {
+            ext_workspace_handle_v1::Event::Name { name } => entry.name = Some(name),
+            ext_workspace_handle_v1::Event::Coordinates { coordinates } => {
+                entry.coordinates = coordinates
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_ne_bytes(*chunk))
+                    .collect();
+            }
+            ext_workspace_handle_v1::Event::State { state: flags } => {
+                let bits = match flags {
+                    WEnum::Value(flags) => flags.bits(),
+                    WEnum::Unknown(raw) => raw,
+                };
+                entry.active = bits & WsState::Active.bits() != 0;
+                entry.hidden = bits & WsState::Hidden.bits() != 0;
+            }
+            ext_workspace_handle_v1::Event::Removed => {
+                state.workspaces.remove(&proxy.id());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -281,16 +434,34 @@ impl Dispatch<ZcosmicToplevelHandleV1, ()> for State {
             } => {
                 // A window can be visible on several outputs and reports one
                 // geometry per output. Keep them all; the caller picks.
-                state
-                    .geometry
-                    .entry(id.clone())
-                    .or_default()
-                    .push((output.id(), Rect { x, y, width, height }));
+                state.geometry.entry(id.clone()).or_default().push((
+                    output.id(),
+                    Rect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                ));
+            }
+            // v3 replaced the zcosmic_workspace_* events with the standard
+            // workspace objects, which is what the workspace manager can name.
+            zcosmic_toplevel_handle_v1::Event::ExtWorkspaceEnter { workspace } => {
+                let entered = state.window_workspaces.entry(id.clone()).or_default();
+                if !entered.contains(&workspace.id()) {
+                    entered.push(workspace.id());
+                }
+            }
+            zcosmic_toplevel_handle_v1::Event::ExtWorkspaceLeave { workspace } => {
+                if let Some(entered) = state.window_workspaces.get_mut(&id) {
+                    entered.retain(|other| *other != workspace.id());
+                }
             }
             zcosmic_toplevel_handle_v1::Event::Closed => {
                 state.windows.remove(&id);
                 state.geometry.remove(&id);
                 state.cosmic_handles.remove(&id);
+                state.window_workspaces.remove(&id);
             }
             _ => {}
         }
@@ -308,8 +479,10 @@ impl Dispatch<ZcosmicToplevelManagerV1, ()> for State {
     ) {
         if let zcosmic_toplevel_manager_v1::Event::Capabilities { capabilities } = event {
             state.capabilities = capabilities
-                .chunks_exact(4)
-                .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| u32::from_ne_bytes(*chunk))
                 .collect();
         }
     }
@@ -317,8 +490,10 @@ impl Dispatch<ZcosmicToplevelManagerV1, ()> for State {
 
 /// Decodes the `state` array: a list of native-endian u32 enum values.
 fn state_names(raw: &[u8]) -> Vec<String> {
-    raw.chunks_exact(4)
-        .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_ne_bytes(*chunk))
         .map(|value| match value {
             0 => "maximized",
             1 => "minimized",
@@ -338,6 +513,7 @@ pub struct Snapshot {
     state: State,
     list: ExtForeignToplevelListV1,
     manager: Option<ZcosmicToplevelManagerV1>,
+    workspace_manager: Option<ExtWorkspaceManagerV1>,
     seat: Option<wl_seat::WlSeat>,
 }
 
@@ -363,12 +539,58 @@ impl Snapshot {
                         window.logical = Some(*rect);
                     }
                 }
+                if self.state.info_version >= 3
+                    && self.state.workspace_protocol
+                    && let Some((workspaces, on_active)) = self.workspaces_of(id)
+                {
+                    window.workspaces = Some(workspaces);
+                    window.on_active_workspace = Some(on_active);
+                }
                 window
             })
             .filter(|window| !window.identifier.is_empty())
             .collect();
         windows.sort_by(|a, b| a.app_id.cmp(&b.app_id).then(a.title.cmp(&b.title)));
         windows
+    }
+
+    /// Joins a window's `ext_workspace_enter` ids to the workspace manager's
+    /// names, groups and active flags.
+    ///
+    /// Returns `None` when any id cannot be resolved: a partial list would be
+    /// worse than "unknown", because a window on two workspaces would look like
+    /// it is on one.
+    fn workspaces_of(&self, window: &ObjectId) -> Option<(Vec<WindowWorkspace>, bool)> {
+        let ids = self.state.window_workspaces.get(window)?;
+        if ids.is_empty() {
+            return None;
+        }
+        let mut views = Vec::with_capacity(ids.len());
+        for workspace_id in ids {
+            let workspace = self.state.workspaces.get(workspace_id)?;
+            let group_id = self.state.workspace_group.get(workspace_id)?;
+            let group = self
+                .state
+                .group_order
+                .iter()
+                .position(|candidate| candidate == group_id)?;
+            let mut view = workspace.clone();
+            view.group = group;
+            view.outputs = self
+                .state
+                .group_outputs
+                .get(group_id)
+                .map(|outputs| {
+                    outputs
+                        .iter()
+                        .filter_map(|output| self.state.outputs.get(output).cloned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            views.push(view);
+        }
+        let on_active = views.iter().any(|workspace| workspace.active);
+        Some((views, on_active))
     }
 
     /// Resolves a `window` argument to exactly one window.
@@ -435,6 +657,9 @@ impl Snapshot {
 impl Drop for Snapshot {
     fn drop(&mut self) {
         self.list.destroy();
+        if let Some(manager) = self.workspace_manager.as_ref() {
+            manager.stop();
+        }
     }
 }
 
@@ -448,10 +673,19 @@ fn connect(with_manager: bool) -> Result<Snapshot> {
     let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).context(
         "bind zcosmic_toplevel_info_v1 v2 (does this compositor have the COSMIC protocols?)",
     )?;
+    let info_version = info.version();
 
     let list: ExtForeignToplevelListV1 = globals
         .bind(&qh, 1..=1, ())
         .context("bind ext_foreign_toplevel_list_v1 (compositor does not support it)")?;
+
+    // Workspace membership is optional: v3 of the toplevel info protocol
+    // reports it as ext_workspace_handle_v1 objects, and only this manager can
+    // turn those into names and active flags. Without either, the fields stay
+    // null instead of being guessed.
+    let workspace_manager = globals
+        .bind::<ExtWorkspaceManagerV1, _, _>(&qh, 1..=1, ())
+        .ok();
 
     let manager = if with_manager {
         globals
@@ -471,13 +705,17 @@ fn connect(with_manager: bool) -> Result<Snapshot> {
 
     let mut state = State {
         info: Some(info),
+        info_version,
+        workspace_protocol: workspace_manager.is_some(),
         ..State::default()
     };
     // Titles and geometry trail the handles by one or two batches: the
     // `get_cosmic_toplevel` requests only go out while dispatching the
     // Toplevel events of the first roundtrip.
     for _ in 0..4 {
-        queue.roundtrip(&mut state).context("roundtrip for toplevels")?;
+        queue
+            .roundtrip(&mut state)
+            .context("roundtrip for toplevels")?;
     }
     // The initial state of a cosmic handle (states, geometry) is pushed from
     // inside the compositor's frame-commit path, so an idle compositor needs
@@ -492,7 +730,9 @@ fn connect(with_manager: bool) -> Result<Snapshot> {
             .all(|window| window.state.is_empty() && window.logical.is_none())
     {
         std::thread::sleep(std::time::Duration::from_millis(60));
-        queue.roundtrip(&mut state).context("roundtrip for toplevels")?;
+        queue
+            .roundtrip(&mut state)
+            .context("roundtrip for toplevels")?;
     }
 
     Ok(Snapshot {
@@ -501,6 +741,7 @@ fn connect(with_manager: bool) -> Result<Snapshot> {
         state,
         list,
         manager,
+        workspace_manager,
         seat,
     })
 }

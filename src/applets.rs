@@ -197,7 +197,9 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
              touch anything. Looked for {:?} under {}",
             before.len(),
             wanted,
-            config_root().map(|root| root.display().to_string()).unwrap_or_default()
+            config_root()
+                .map(|root| root.display().to_string())
+                .unwrap_or_default()
         );
     }
 
@@ -205,8 +207,7 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
     // user can still recover a whole panel section by hand.
     for (file, text) in &targets {
         let _ = backup(file, text);
-        std::fs::write(file, "None")
-            .with_context(|| format!("blank {}", file.display()))?;
+        std::fs::write(file, "None").with_context(|| format!("blank {}", file.display()))?;
     }
     // The config watcher debounces, so give it time to see the blank value.
     std::thread::sleep(Duration::from_millis(1200));
@@ -235,7 +236,9 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
         // The panel respawns one applet per screen, and they do not come up at
         // the same instant: wait until every old pid is gone and at least one
         // replacement exists, then report the freshest listing.
-        let old_gone = before.iter().all(|old| !now.iter().any(|new| new.pid == old.pid));
+        let old_gone = before
+            .iter()
+            .all(|old| !now.iter().any(|new| new.pid == old.pid));
         if old_gone && !now.is_empty() {
             std::thread::sleep(Duration::from_millis(400));
             return Ok(list()?.into_iter().filter(matches).collect());
@@ -306,7 +309,8 @@ fn config_root() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
-            let home = std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
+            let home =
+                std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
             PathBuf::from(home).join(".config")
         }
     };
@@ -336,10 +340,7 @@ fn panel_config_files() -> Vec<PathBuf> {
 
 fn backup_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".local/state/cosmic-desktop-mcp/panel-backups"),
-    )
+    Some(PathBuf::from(home).join(".local/state/cosmic-desktop-mcp/panel-backups"))
 }
 
 fn backup(file: &Path, text: &str) -> Result<PathBuf> {

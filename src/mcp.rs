@@ -15,9 +15,12 @@ use serde_json::{Value, json};
 use crate::applets;
 use crate::clipboard;
 use crate::config;
+use crate::coords::{self, HitCandidate, HitResult, WindowGeometry};
 use crate::input;
 use crate::keymap::Button;
-use crate::wl::{capture, toplevel, workspace};
+use crate::lockstate;
+use crate::wl::toplevel::{self, Window};
+use crate::wl::{capture, workspace};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -87,9 +90,10 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "screenshot",
-            "description": "Capture a display and save it as a PNG. Returns the file path so the \
-caller can open it. Coordinates accepted by click/move/scroll are in the captured image's pixel \
-space, with no downscaling applied.",
+            "description": "Capture one output and save it as a PNG. Returns the path, the image \
+    size and \"screen_locked\" (null when logind could not be asked). This image is the pixel space \
+    click/move/scroll accept for this output, with no downscaling applied. screen_locked=true means \
+    the frame is the lock screen or a blanked desktop, not the user's session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -104,31 +108,38 @@ space, with no downscaling applied.",
         {
             "name": "env_info",
             "description": "Report the current desktop topology and whether the input backend is \
-ready. Cheap, side-effect free: it never opens an EIS session, so it cannot raise a portal \
-authorization dialog. Call it before the first click when you do not know how many outputs \
-exist, or when a click seems to do nothing and you need to know whether input is authorized.",
+    ready. Cheap, side-effect free: it never opens an EIS session, so it cannot raise a portal \
+    authorization dialog. Call it before the first click when you do not know how many outputs \
+    exist, or when a click seems to do nothing and you need to know whether input is authorized.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "list_windows",
             "description": "List open windows with identifier, title, app_id, COSMIC state \
-(maximized/minimized/activated/fullscreen/sticky) and **placement**. Geometry comes from \
-zcosmic_toplevel_info_v1 and is reported twice: \"logical\" (compositor coordinates relative to \
-the output) and \"pixels\" (the same rect in that output's screenshot space, ready to pass to \
-click/move/scroll). \"pixels\" is null until the input session exists, because the logical-to-\
-pixel factor is only trustworthy when it comes from the EIS region. Use this instead of \
-guessing where a window is.",
+    (maximized/minimized/activated/fullscreen/sticky), **placement** and **workspace membership**. \
+    Geometry comes from zcosmic_toplevel_info_v1 and is reported twice: \"logical\" (compositor \
+    coordinates relative to the output) and \"pixels\" (the same rect in that output's screenshot \
+    space, which is what click/move/scroll take, together with \"output.index\"). \"pixels\" is null \
+    until the input session exists, because the logical-to-pixel factor is only trustworthy when it \
+    comes from the EIS region. \"workspaces\" lists every workspace the window is on (group, name, \
+    active); \"on_active_workspace\" says whether one of them is the one its output currently shows. \
+    Both are null when the compositor did not expose membership. A window on an inactive workspace \
+    still has geometry — its last placement — so clicking those pixels hits whatever is visible \
+    instead.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "screenshot_window",
             "description": "Capture one window: finds the window's output, screenshots it and crops \
-to the window rect. Returns the PNG path, the crop size and the window's origin **in that \
-output's screenshot pixel space**, so a point (dx,dy) inside the returned image is \
-click(x=origin_x+dx, y=origin_y+dy, output=output_index). The crop shows whatever is on screen \
-in that region: if the window is covered (fullscreen video, another window on top) activate it \
-with window_action first. May open the input session (and a portal dialog) on first use, because \
-the crop needs the output's scale factor.",
+    to the window rect. Returns JSON with the PNG path, the crop size (\"image\"), the window's \
+    \"logical\" rect, its \"pixels\" rect in the output's screenshot space, the crop \"origin\", the \
+    \"output\" (index + name) and the real \"scale\". The returned image is the **window image \
+    pixel** space: pass a point from it straight to click_window / move_window / scroll_window, \
+    which resolve the output and origin themselves. Do not add origin to the coordinates and call \
+    click — that is the mistake this API is shaped to prevent. The crop shows whatever is on screen \
+    in that region: if the window is covered (fullscreen video, another window on top) activate it \
+    with window_action first. May open the input session (and a portal dialog) on first use, because \
+    the crop needs the output's scale factor.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -143,10 +154,10 @@ the crop needs the output's scale factor.",
         {
             "name": "window_action",
             "description": "Ask the compositor to act on a window: activate, close, maximize, \
-unmaximize, minimize, unminimize, fullscreen, unfullscreen (zcosmic_toplevel_manager_v1). \
-**Use activate before typing**: an EIS click does not move keyboard focus on COSMIC, so click + \
-type_text lands in whatever was focused before unless the window is activated first. The \
-compositor may ignore a request; re-list to confirm the resulting state.",
+    unmaximize, minimize, unminimize, fullscreen, unfullscreen (zcosmic_toplevel_manager_v1). \
+    **Use activate before typing**: an EIS click does not move keyboard focus on COSMIC, so click + \
+    type_text lands in whatever was focused before unless the window is activated first. The \
+    compositor may ignore a request; re-list to confirm the resulting state.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -164,8 +175,12 @@ compositor may ignore a request; re-list to confirm the resulting state.",
         },
         {
             "name": "click",
-            "description": "Click a point given in screenshot pixel coordinates. Moves the pointer \
-first, waits for the compositor to register the hover, then presses and releases.",
+            "description": "Click at (x,y) in the screenshot pixel space of the chosen output. \
+    The output argument defaults to 0 and is never inferred from x/y, so coordinates taken from \
+    another output's screenshot click the wrong monitor. If the point came from screenshot_window, \
+    use click_window instead. The reply names the output actually used and the window under the \
+    point (null = no window reported there), and warns when the same (x,y) lands inside a window on \
+    a different output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -191,7 +206,10 @@ first, waits for the compositor to register the hover, then presses and releases
         },
         {
             "name": "move",
-            "description": "Move the pointer without clicking (hover), in screenshot pixel coordinates.",
+            "description": "Move the pointer without clicking (hover), in the screenshot pixel \
+    space of the chosen output (default 0, never inferred from x/y). For a point taken from \
+    screenshot_window use move_window. The reply reports the output used and the window under the \
+    point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -207,9 +225,11 @@ first, waits for the compositor to register the hover, then presses and releases
         },
         {
             "name": "scroll",
-            "description": "Scroll the wheel at a point. Positive dy scrolls UP (reveals earlier \
-content, matching the kernel REL_WHEEL convention), negative dy scrolls down; positive dx \
-scrolls right.",
+            "description": "Scroll the wheel at (x,y) in the screenshot pixel space of the chosen \
+    output (default 0, never inferred from x/y). Positive dy scrolls UP (reveals earlier content, \
+    matching the kernel REL_WHEEL convention), negative dy scrolls down; positive dx scrolls right. \
+    For a point taken from screenshot_window use scroll_window. The reply reports the output used \
+    and the window under the point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -226,12 +246,87 @@ scrolls right.",
             }
         },
         {
+            "name": "click_window",
+            "description": "Click at (x,y) in the image returned by screenshot_window for the \
+    named window. The tool resolves the window's output and the crop origin itself: there is no \
+    output index and no arithmetic to get wrong. Use this instead of click for anything inside a \
+    window, because click defaults to output 0 and cannot tell which monitor the coordinates came \
+    from. The reply includes the image size, the output pixel and logical point actually used, and \
+    the window under the point.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "description": "Window identifier, app_id, or exact/unique title substring."
+                    },
+                    "x": {
+                        "type": "integer",
+                        "description": "Pixel x in the image returned by screenshot_window."
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Pixel y in the image returned by screenshot_window."
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "description": "Default left."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "enum": [1, 2],
+                        "description": "1 = single click, 2 = double click. Default 1."
+                    }
+                },
+                "required": ["window", "x", "y"]
+            }
+        },
+        {
+            "name": "move_window",
+            "description": "Move the pointer to (x,y) in the image returned by screenshot_window \
+    for the named window. Resolves the output and crop origin internally; use it instead of move for \
+    a hover inside a window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "description": "Window identifier, app_id, or exact/unique title substring."
+                    },
+                    "x": {"type": "integer", "description": "Pixel x in the screenshot_window image."},
+                    "y": {"type": "integer", "description": "Pixel y in the screenshot_window image."}
+                },
+                "required": ["window", "x", "y"]
+            }
+        },
+        {
+            "name": "scroll_window",
+            "description": "Scroll the wheel at (x,y) in the image returned by screenshot_window \
+    for the named window. Positive dy scrolls UP, negative down; positive dx scrolls right. Resolves \
+    the output and crop origin internally.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "description": "Window identifier, app_id, or exact/unique title substring."
+                    },
+                    "x": {"type": "integer", "description": "Pixel x in the screenshot_window image."},
+                    "y": {"type": "integer", "description": "Pixel y in the screenshot_window image."},
+                    "dy": {"type": "integer", "description": "Wheel clicks, vertical."},
+                    "dx": {"type": "integer", "description": "Wheel clicks, horizontal."}
+                },
+                "required": ["window", "x", "y"]
+            }
+        },
+        {
             "name": "type_text",
             "description": "Type text into the focused window. Default mode \"paste\" puts the text \
-on the clipboard and presses ctrl+v: this is the reliable path, because synthesized keycodes are \
-routed through the active input method and ASCII turns into pinyin candidates under fcitx5. Mode \
-\"keys\" injects keycodes instead (printable ASCII only) and is only correct when no input method \
-is active or real key events are wanted. Note that paste mode overwrites the clipboard.",
+    on the clipboard and presses ctrl+v: this is the reliable path, because synthesized keycodes are \
+    routed through the active input method and ASCII turns into pinyin candidates under fcitx5. Mode \
+    \"keys\" injects keycodes instead (printable ASCII only) and is only correct when no input method \
+    is active or real key events are wanted. Note that paste mode overwrites the clipboard.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -248,8 +343,8 @@ is active or real key events are wanted. Note that paste mode overwrites the cli
         {
             "name": "clipboard_write",
             "description": "Put text on the clipboard without pasting it. Useful when the target \
-cannot take ctrl+v, or when the same text is pasted several times. The entry lives as long as \
-this server process.",
+    cannot take ctrl+v, or when the same text is pasted several times. The entry lives as long as \
+    this server process.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"text": {"type": "string"}},
@@ -273,9 +368,9 @@ this server process.",
         {
             "name": "workspaces",
             "description": "List COSMIC workspaces over ext_workspace_manager_v1: group (one per \
-output), name, grid position, and active / urgent / hidden state. COSMIC workspaces are per \
-output, so every group has its own \"1\", \"2\", ... Pass \"activate\" to switch, plus \"group\" \
-when the name exists on several outputs.",
+    output), name, grid position, and active / urgent / hidden state. COSMIC workspaces are per \
+    output, so every group has its own \"1\", \"2\", ... Pass \"activate\" to switch, plus \"group\" \
+    when the name exists on several outputs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -294,20 +389,20 @@ when the name exists on several outputs.",
         {
             "name": "applets",
             "description": "List running COSMIC panel applets as processes: name, pid, parent, \
-memory and age. Every applet is a normal process supervised by cosmic-panel, so there is one \
-instance per panel (two monitors = two copies of each applet).",
+    memory and age. Every applet is a normal process supervised by cosmic-panel, so there is one \
+    instance per panel (two monitors = two copies of each applet).",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "restart_applet",
             "description": "Restart a panel applet by blanking and rewriting the cosmic-panel \
-plugins_* config entry that lists it. That is the only thing observed to make the panel respawn an \
-applet: a plain SIGTERM leaves the slot empty, because cosmic-panel does not supervise its applets \
-even though it builds a launch-pad ProcessManager. In practice the panel rebuilds every applet on \
-that section (time, workspaces and audio all get new pids), so treat this as a panel refresh. The \
-original config text is always written back, and a backup lands in \
-~/.local/state/cosmic-desktop-mcp/panel-backups/. Accepts a full name (cosmic-applet-time) or the \
-suffix (time).",
+    plugins_* config entry that lists it. That is the only thing observed to make the panel respawn an \
+    applet: a plain SIGTERM leaves the slot empty, because cosmic-panel does not supervise its applets \
+    even though it builds a launch-pad ProcessManager. In practice the panel rebuilds every applet on \
+    that section (time, workspaces and audio all get new pids), so treat this as a panel refresh. The \
+    original config text is always written back, and a backup lands in \
+    ~/.local/state/cosmic-desktop-mcp/panel-backups/. Accepts a full name (cosmic-applet-time) or the \
+    suffix (time).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -322,8 +417,8 @@ suffix (time).",
         {
             "name": "app_logs",
             "description": "Recent stderr from one applet, straight out of the user journal \
-(journalctl -t <name>). Applets inherit the session's stderr, so this is where their warnings and \
-panics appear — the first place to look when a panel item misbehaves.",
+    (journalctl -t <name>). Applets inherit the session's stderr, so this is where their warnings and \
+    panics appear — the first place to look when a panel item misbehaves.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -336,8 +431,8 @@ panics appear — the first place to look when a panel item misbehaves.",
         {
             "name": "config_read",
             "description": "Read cosmic-config entries. COSMIC stores one setting per file as raw \
-RON text under ~/.config/cosmic/<app-id>/v1/<key>. Omit \"app\" to list app ids; omit \"key\" to \
-dump every key of one app.",
+    RON text under ~/.config/cosmic/<app-id>/v1/<key>. Omit \"app\" to list app ids; omit \"key\" to \
+    dump every key of one app.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -349,9 +444,9 @@ dump every key of one app.",
         {
             "name": "config_write",
             "description": "Write or delete one cosmic-config key. The value is RON written \
-verbatim, so strings keep their quotes and enums keep their variant names. Returns the previous \
-value, which makes the change reversible. COSMIC watches the config tree and most consumers react \
-immediately; applets that only read at startup need restart_applet afterwards.",
+    verbatim, so strings keep their quotes and enums keep their variant names. Returns the previous \
+    value, which makes the change reversible. COSMIC watches the config tree and most consumers react \
+    immediately; applets that only read at startup need restart_applet afterwards.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -385,6 +480,9 @@ fn call_tool(params: Option<&Value>) -> Result<Value> {
         "click" => tool_click(&args),
         "move" => tool_move(&args),
         "scroll" => tool_scroll(&args),
+        "click_window" => tool_click_window(&args),
+        "move_window" => tool_move_window(&args),
+        "scroll_window" => tool_scroll_window(&args),
         "type_text" => tool_type_text(&args),
         "clipboard_write" => tool_clipboard_write(&args),
         "clipboard_read" => tool_clipboard_read(),
@@ -412,7 +510,13 @@ fn call_tool(params: Option<&Value>) -> Result<Value> {
 
 fn tool_screenshot(args: &Value) -> Result<String> {
     let index = args.get("output").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let shot = capture::capture(index)?;
+    let lock = lockstate::detect();
+    let shot = capture::capture(index).with_context(|| {
+        format!(
+            "capturing output {index} failed; session lock state: {}",
+            lock.evidence
+        )
+    })?;
 
     let dir = runtime_dir().join("cosmic-desktop-mcp");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -428,13 +532,38 @@ fn tool_screenshot(args: &Value) -> Result<String> {
         .save_with_format(&path, image::ImageFormat::Png)
         .with_context(|| format!("write {}", path.display()))?;
 
-    Ok(format!(
-        "{}\n{}x{} output_index={} (coordinates are in this image's pixel space)",
-        path.display(),
-        shot.width,
-        shot.height,
-        shot.output.index
-    ))
+    let mut notes = vec![
+        "this image is output screenshot pixel space: pass (x, y) from it to click/move/scroll \
+         with the same output index"
+            .to_string(),
+    ];
+    if lock.locked() == Some(true) {
+        notes.push(
+            "the session is locked: this frame is the lock screen or a blanked desktop, not the \
+             user's desktop. Ask the user to unlock before acting on what you see."
+                .to_string(),
+        );
+    }
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "path": path.display().to_string(),
+        "image": {"width": shot.width, "height": shot.height},
+        "output": {
+            "index": shot.output.index,
+            "name": shot.output.name,
+            "size": {"width": shot.output.width, "height": shot.output.height},
+        },
+        "screen_locked": lock.locked(),
+        "lock_evidence": lock.evidence,
+        "notes": notes,
+        "summary": format!(
+            "{}\n{}x{} output_index={} (coordinates are in this image's pixel space)",
+            path.display(),
+            shot.width,
+            shot.height,
+            shot.output.index
+        ),
+    }))?)
 }
 
 /// Current topology plus input readiness.
@@ -482,8 +611,13 @@ fn tool_env_info() -> Result<String> {
     }
 
     let mut notes = vec![
-        "click/move/scroll take pixel coordinates of a screenshot of the chosen output; the \
-         conversion to logical desktop coordinates happens inside the tool."
+        "click/move/scroll take pixel coordinates of a screenshot of the chosen output and \
+         require that output index; the conversion to logical desktop coordinates happens \
+         inside the tool."
+            .to_string(),
+        "for a point inside a window, use click_window/move_window/scroll_window with a point \
+         from screenshot_window: those resolve the window's output and crop origin themselves, \
+         so there is no output index to get wrong."
             .to_string(),
     ];
     if session.is_none() {
@@ -587,7 +721,9 @@ fn tool_config_write(args: &Value) -> Result<String> {
         .context("config_write needs \"key\"")?;
     // A missing or null value means "delete this key".
     let value = args.get("value").and_then(Value::as_str);
-    Ok(serde_json::to_string_pretty(&config::write(app, key, value)?)?)
+    Ok(serde_json::to_string_pretty(&config::write(
+        app, key, value,
+    )?)?)
 }
 
 /// Returns the index of the output with connector `name`, if still present.
@@ -598,42 +734,281 @@ fn output_index_for(name: &str, outputs: &[capture::OutputInfo]) -> Option<usize
         .map(|out| out.index)
 }
 
-fn tool_list_windows() -> Result<String> {
-    let windows = toplevel::list()?;
-    let outputs = input::outputs()?;
-    // `peek` never opens a session, so listing stays free of authorization
-    // dialogs; without regions the pixel rect is simply null.
-    let regions = crate::eis::peek()
-        .map(|session| session.regions())
-        .unwrap_or_default();
+/// Everything a pointer tool needs at one instant: windows, outputs, EIS
+/// regions, and each window's geometry in all three coordinate spaces.
+///
+/// Built once per call so the hit test, the conversion and the reply all
+/// describe the same desktop. `open_session = false` is for status-like calls:
+/// peeking never raises a portal dialog, and without regions the pixel rects
+/// are null rather than guessed.
+struct Scene {
+    windows: Vec<Window>,
+    outputs: Vec<capture::OutputInfo>,
+    regions: Vec<crate::eis::Region>,
+    geoms: Vec<Option<WindowGeometry>>,
+}
 
-    let rows: Vec<Value> = windows
+impl Scene {
+    fn load(open_session: bool) -> Result<Self> {
+        let windows = toplevel::list()?;
+        Self::from_windows(windows, open_session)
+    }
+
+    fn from_windows(windows: Vec<Window>, open_session: bool) -> Result<Self> {
+        let outputs = input::outputs()?;
+        let regions = if open_session {
+            crate::eis::session()?.regions()
+        } else {
+            crate::eis::peek()
+                .map(|session| session.regions())
+                .unwrap_or_default()
+        };
+        let geoms = windows
+            .iter()
+            .map(|window| {
+                let index = window
+                    .output
+                    .as_deref()
+                    .and_then(|name| output_index_for(name, &outputs))?;
+                let out = outputs.get(index)?;
+                let region = input::region_for(out, &regions).ok()?.region;
+                WindowGeometry::new(
+                    region,
+                    index,
+                    window.output.clone(),
+                    window.logical?,
+                    (out.width, out.height),
+                )
+            })
+            .collect();
+        Ok(Self {
+            windows,
+            outputs,
+            regions,
+            geoms,
+        })
+    }
+
+    fn find_index(&self, needle: &str) -> Result<usize> {
+        let target = toplevel::find(&self.windows, needle)?;
+        self.windows
+            .iter()
+            .position(|window| window.identifier == target.identifier)
+            .with_context(|| format!("window {:?} disappeared", target.title))
+    }
+
+    fn geometry(&self, index: usize) -> Result<&WindowGeometry> {
+        self.geoms[index].as_ref().with_context(|| {
+            format!(
+                "{:?} has no usable geometry: the compositor may not have reported it yet, or \
+                 the window lies entirely outside its output. Re-run list_windows.",
+                self.windows[index].title
+            )
+        })
+    }
+
+    fn output(&self, index: usize) -> Result<&capture::OutputInfo> {
+        self.outputs
+            .get(index)
+            .with_context(|| format!("no output #{index} (there are {})", self.outputs.len()))
+    }
+
+    /// Windows whose reported rect covers the point, excluding minimized ones
+    /// and those on an inactive workspace: their geometry is a remembered
+    /// placement, not what the output shows. Stacking order is not exposed, so
+    /// the result may be ambiguous.
+    fn hit(&self, output: usize, x: i32, y: i32) -> HitResult {
+        let candidates: Vec<HitCandidate> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(index, window)| {
+                self.geoms[*index]
+                    .as_ref()
+                    .is_some_and(|geometry| geometry.output_index == output)
+                    && window.on_active_workspace != Some(false)
+                    && !window.state.iter().any(|state| state == "minimized")
+            })
+            .filter_map(|(index, window)| {
+                let geometry = self.geoms[index].as_ref()?;
+                Some(HitCandidate {
+                    index,
+                    rect: geometry.pixels,
+                    activated: window.state.iter().any(|state| state == "activated"),
+                })
+            })
+            .collect();
+        coords::hit_test(&candidates, x, y)
+    }
+}
+
+fn output_json(out: &capture::OutputInfo) -> Value {
+    json!({
+        "index": out.index,
+        "name": out.name,
+        "size": {"width": out.width, "height": out.height},
+    })
+}
+
+fn window_ref(window: &Window) -> Value {
+    json!({
+        "identifier": window.identifier,
+        "title": window.title,
+        "app_id": window.app_id,
+    })
+}
+
+fn hit_json(scene: &Scene, hit: &HitResult) -> Value {
+    json!({
+        "window": hit.window.map(|index| window_ref(&scene.windows[index])),
+        "candidates": hit
+            .candidates
+            .iter()
+            .map(|index| window_ref(&scene.windows[*index]))
+            .collect::<Vec<_>>(),
+        "ambiguous": hit.ambiguous,
+        "basis": "window geometry as last reported, restricted to the active workspace and \
+                  excluding minimized windows. The compositor exposes no stacking order, so \
+                  several candidates mean window is the activated one or null when that is \
+                  also ambiguous; null with no candidates means the desktop, another \
+                  workspace, or a window that has not reported geometry.",
+    })
+}
+
+/// The exact signature of the output-index mistake: the point is empty on the
+/// requested output but lands inside a window on another one. Only consulted
+/// when the requested output has no window under the point, so overlapping
+/// coordinate ranges on two monitors do not produce noise.
+fn other_output_match(scene: &Scene, requested: usize, x: i32, y: i32) -> Option<Value> {
+    for (index, out) in scene.outputs.iter().enumerate() {
+        if index == requested || x < 0 || y < 0 || x >= out.width || y >= out.height {
+            continue;
+        }
+        let hit = scene.hit(index, x, y);
+        let Some(found) = hit.window.or_else(|| hit.candidates.first().copied()) else {
+            continue;
+        };
+        let window = &scene.windows[found];
+        return Some(json!({
+            "output": output_json(out),
+            "window": window_ref(window),
+            "warning": format!(
+                "({x}, {y}) is not over a window on output {requested}, but the same point is \
+                 inside {:?} on output {index}: these look like output {index}'s screenshot \
+                 coordinates. Pass output={index}, or use click_window for a window image.",
+                window.title
+            ),
+        }));
+    }
+    None
+}
+
+fn pointer_notes(window: &Window, geometry: &WindowGeometry) -> Vec<String> {
+    let mut notes = Vec::new();
+    if window.on_active_workspace == Some(false) {
+        let where_ = window
+            .workspaces
+            .as_ref()
+            .map(|workspaces| {
+                workspaces
+                    .iter()
+                    .map(|workspace| {
+                        format!(
+                            "group {} {:?}",
+                            workspace.group,
+                            workspace.name.as_deref().unwrap_or("?")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "an inactive workspace".to_string());
+        notes.push(format!(
+            "the window is on {where_}, which is not active. Its geometry is the last reported \
+             placement, so this action lands on whatever that output currently shows."
+        ));
+    }
+    if window.state.iter().any(|state| state == "minimized") {
+        notes.push(
+            "the window is minimized: its geometry is the last placement, not visible pixels."
+                .to_string(),
+        );
+    }
+    if geometry.image.width != geometry.pixels.width
+        || geometry.image.height != geometry.pixels.height
+    {
+        notes.push(
+            "the window is partly off-screen; only the visible part is in the image.".to_string(),
+        );
+    }
+    notes
+}
+
+fn lock_notes() -> (Option<bool>, String, Vec<String>) {
+    let report = lockstate::detect();
+    let mut notes = Vec::new();
+    if report.locked() == Some(true) {
+        notes.push(
+            "the session is locked: this input goes to the lock screen, not the user's desktop."
+                .to_string(),
+        );
+    }
+    (report.locked(), report.evidence, notes)
+}
+
+fn logical_json(x: f64, y: f64) -> Value {
+    let round = |value: f64| (value * 1000.0).round() / 1000.0;
+    json!({"x": round(x), "y": round(y)})
+}
+
+fn point_in_output(out: &capture::OutputInfo, x: i32, y: i32) -> Result<()> {
+    if x < 0 || y < 0 || x >= out.width || y >= out.height {
+        bail!(
+            "point ({x}, {y}) is outside output #{} {}, whose screenshot is {}x{}. Coordinates \
+             belong to one output: use the output the screenshot came from, or click_window \
+             for a point inside a screenshot_window image.",
+            out.index,
+            out.name.as_deref().unwrap_or("<unnamed>"),
+            out.width,
+            out.height
+        );
+    }
+    Ok(())
+}
+
+fn tool_list_windows() -> Result<String> {
+    let scene = Scene::load(false)?;
+    let (locked, lock_evidence, _) = lock_notes();
+
+    let rows: Vec<Value> = scene
+        .windows
         .iter()
-        .map(|window| {
+        .enumerate()
+        .map(|(position, window)| {
+            let geometry = scene.geoms[position].as_ref();
             let index = window
                 .output
                 .as_deref()
-                .and_then(|name| output_index_for(name, &outputs));
-            // Only convert when a region is available; guessing a scale is
-            // how coordinates end up off by 20%.
-            let pixels = match (index, window.logical) {
-                (Some(index), Some(rect)) => match input::region_for(&outputs[index], &regions) {
-                    Ok(matched) => json!(input::scale_rect(rect, matched.region.scale)),
-                    Err(_) => Value::Null,
-                },
-                _ => Value::Null,
-            };
+                .and_then(|name| output_index_for(name, &scene.outputs));
+            let output = index.map(|index| {
+                let out = &scene.outputs[index];
+                json!({
+                    "index": index,
+                    "name": window.output,
+                    "size": {"width": out.width, "height": out.height},
+                    "scale": geometry.map(|geometry| geometry.region.scale),
+                })
+            });
             json!({
                 "identifier": window.identifier,
                 "title": window.title,
                 "app_id": window.app_id,
                 "state": window.state,
-                "output": index.map(|index| json!({
-                    "index": index,
-                    "name": window.output,
-                })),
+                "output": output,
                 "logical": window.logical,
-                "pixels": pixels,
+                "pixels": geometry.map(|geometry| geometry.pixels),
+                "workspaces": window.workspaces,
+                "on_active_workspace": window.on_active_workspace,
             })
         })
         .collect();
@@ -641,17 +1016,35 @@ fn tool_list_windows() -> Result<String> {
     let mut notes = vec![
         "`logical` is the compositor's placement relative to `output`, in logical coordinates; \
          `pixels` is the same rect in that output's screenshot pixel space, which is what \
-         click/move/scroll accept. `pixels` is null until the EIS session exists."
+         click/move/scroll accept (with the same output.index). `pixels` is null until the EIS \
+         session exists."
+            .to_string(),
+        "for a point inside a window, take it from screenshot_window and call click_window: it \
+         resolves the output and the crop origin itself, so there is no output index to get \
+         wrong and no arithmetic."
             .to_string(),
         "geometry is placement as last reported, not visibility: a fullscreen or simply \
          overlapping window still sits at its tiled coordinates, so the region can show \
-         something else. window_action activate brings a window to the top."
+         something else. on_active_workspace=false is the stronger case — the window is on a \
+         workspace that output does not currently show."
             .to_string(),
     ];
-    if windows.iter().any(|window| window.logical.is_none()) {
+    if scene.windows.iter().any(|window| window.logical.is_none()) {
         notes.push(
             "some windows have no geometry yet: the compositor sends it on the first map and \
              again on every move/resize, so re-list after a moment"
+                .to_string(),
+        );
+    }
+    if scene
+        .windows
+        .iter()
+        .any(|window| window.workspaces.is_none())
+    {
+        notes.push(
+            "workspaces is null for some windows: this compositor did not report workspace \
+             membership (zcosmic_toplevel_info_v1 v3 ext_workspace_enter plus \
+             ext_workspace_manager_v1). That is unknown, not 'on no workspace'."
                 .to_string(),
         );
     }
@@ -659,11 +1052,14 @@ fn tool_list_windows() -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
         "count": rows.len(),
         "windows": rows,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
         "notes": notes,
     }))?)
 }
 
-/// Crops the window out of a screenshot of its output.
+/// Crops the window out of a screenshot of its output and reports the same
+/// geometry fields as `list_windows`.
 ///
 /// Needs the EIS region for the scale factor, so the first call may open a
 /// session (and with it a portal authorization dialog).
@@ -672,40 +1068,43 @@ fn tool_screenshot_window(args: &Value) -> Result<String> {
         .get("window")
         .and_then(Value::as_str)
         .context("screenshot_window needs \"window\" (identifier, app_id or title)")?;
+    // Resolve the window before opening a session, so a typo does not raise a
+    // portal dialog.
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
+    let scene = Scene::from_windows(windows, true)?;
+    let index = scene.find_index(&target.identifier)?;
+    let base = scene.geometry(index)?.clone();
+    let window = &scene.windows[index];
+    let out = scene.output(base.output_index)?;
 
-    let rect = target
-        .logical
-        .with_context(|| format!("{:?} has no geometry yet", target.title))?;
-    let name = target
-        .output
-        .clone()
-        .context("the window geometry carries no output name")?;
-    let outputs = input::outputs()?;
-    let index = output_index_for(&name, &outputs).with_context(|| {
-        format!("window is on output {name}, which is no longer in the output list")
+    let shot = capture::capture(base.output_index)?;
+    // Clamp against the frame's own size: it should equal the wl_output mode,
+    // but the frame is what the pixels actually come from.
+    let geometry = WindowGeometry::new(
+        base.region,
+        base.output_index,
+        base.output_name,
+        base.logical,
+        (shot.width as i32, shot.height as i32),
+    )
+    .with_context(|| {
+        format!(
+            "{:?} lies entirely outside output #{} ({}x{})",
+            target.title, out.index, shot.width, shot.height
+        )
     })?;
-
-    let px = input::to_pixels(rect, index)?;
-    let shot = capture::capture(index)?;
-
-    // Clamp: a window can be partly off-screen, and a zero-sized crop is an
-    // error deep inside the image crate.
-    let left = px.x.clamp(0, shot.width as i32);
-    let top = px.y.clamp(0, shot.height as i32);
-    let right = (px.x + px.width).clamp(0, shot.width as i32);
-    let bottom = (px.y + px.height).clamp(0, shot.height as i32);
-    if right <= left || bottom <= top {
-        bail!(
-            "the window is entirely outside output {name} ({left},{top})-({right},{bottom})"
-        );
-    }
-    let (width, height) = ((right - left) as u32, (bottom - top) as u32);
 
     let image = image::RgbaImage::from_raw(shot.width, shot.height, shot.rgba)
         .context("captured frame did not match its declared size")?;
-    let cropped = image::imageops::crop_imm(&image, left as u32, top as u32, width, height).to_image();
+    let cropped = image::imageops::crop_imm(
+        &image,
+        geometry.image.x as u32,
+        geometry.image.y as u32,
+        geometry.image.width as u32,
+        geometry.image.height as u32,
+    )
+    .to_image();
 
     let dir = runtime_dir().join("cosmic-desktop-mcp");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -718,17 +1117,54 @@ fn tool_screenshot_window(args: &Value) -> Result<String> {
         .save_with_format(&path, image::ImageFormat::Png)
         .with_context(|| format!("write {}", path.display()))?;
 
-    Ok(format!(
-        "{}\n{width}x{height} from output_index={index} ({name}), window {:?}\n\
-window origin in that output's screenshot pixels: x={left} y={top}\n\
-to click something at (dx,dy) inside this image use click(x={left}+dx, y={top}+dy, output={index})\n\
-the crop is a rectangle cut from the output at the window's last reported placement, so if the \
-image does not look like {:?} at all, the window is occluded or the session is locked: run \
-window_action activate first and capture again",
-        path.display(),
-        target.title,
-        target.title
-    ))
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.extend(pointer_notes(window, &geometry));
+    notes.push(
+        "the returned image is window image pixel space: pass (x, y) from it to click_window / \
+         move_window / scroll_window for this window. Do not add the origin and call click."
+            .to_string(),
+    );
+    let name = geometry
+        .output_name
+        .clone()
+        .unwrap_or_else(|| "?".to_string());
+    let width = geometry.image.width;
+    let height = geometry.image.height;
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "path": path.display().to_string(),
+        "image": {"width": width, "height": height},
+        "window": window_ref(window),
+        "output": {
+            "index": geometry.output_index,
+            "name": geometry.output_name,
+            "size": {"width": shot.width, "height": shot.height},
+            "scale": geometry.region.scale,
+        },
+        "scale": geometry.region.scale,
+        "logical": geometry.logical,
+        "pixels": geometry.pixels,
+        "origin": {"x": geometry.image.x, "y": geometry.image.y},
+        "workspaces": window.workspaces,
+        "on_active_workspace": window.on_active_workspace,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+        "summary": format!(
+            "{}\n{}x{} from output_index={} ({}), window {:?}\nwindow origin in that output's \
+             screenshot pixels: x={} y={}\nfor a point (dx,dy) inside this image use \
+             click_window(window={:?}, x=dx, y=dy) — no output index and no arithmetic",
+            path.display(),
+            width,
+            height,
+            geometry.output_index,
+            name,
+            window.title,
+            geometry.image.x,
+            geometry.image.y,
+            window.title
+        ),
+    }))?)
 }
 
 fn tool_window_action(args: &Value) -> Result<String> {
@@ -747,28 +1183,116 @@ fn tool_window_action(args: &Value) -> Result<String> {
     ))
 }
 
+fn button_arg(args: &Value) -> Result<Button> {
+    match args.get("button").and_then(Value::as_str) {
+        Some(name) => Button::parse(name),
+        None => Ok(Button::Left),
+    }
+}
+
+fn count_arg(args: &Value) -> u32 {
+    args.get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as u32
+}
+
+fn window_arg<'a>(args: &'a Value, tool: &str) -> Result<&'a str> {
+    args.get("window")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{tool} needs \"window\" (identifier, app_id or title)"))
+}
+
+/// Resolves a window-image point into every space, using the scene's geometry.
+fn window_point(
+    scene: &Scene,
+    needle: &str,
+    x: i32,
+    y: i32,
+) -> Result<(usize, WindowGeometry, i32, i32, f64, f64)> {
+    let index = scene.find_index(needle)?;
+    let geometry = scene.geometry(index)?.clone();
+    let (ox, oy) = geometry.window_to_output(x, y)?;
+    let (lx, ly) = geometry.window_to_logical(x, y)?;
+    Ok((index, geometry, ox, oy, lx, ly))
+}
+
 fn tool_click(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    let button = match args.get("button").and_then(Value::as_str) {
-        Some(name) => Button::parse(name)?,
-        None => Button::Left,
-    };
-    let count = args.get("count").and_then(Value::as_u64).unwrap_or(1).max(1);
+    let button = button_arg(args)?;
+    let count = count_arg(args);
     let output = output_arg(args);
 
-    input::click(button, x, y, output, count as u32)?;
-    Ok(format!(
-        "clicked {button:?} at ({x}, {y}) on output {output} x{count}"
-    ))
+    let scene = Scene::load(true)?;
+    let out = scene.output(output)?;
+    point_in_output(out, x, y)?;
+    let region = input::region_for(out, &scene.regions)?.region;
+    let (lx, ly) = (
+        region.x + f64::from(x) / region.scale,
+        region.y + f64::from(y) / region.scale,
+    );
+    let hit = scene.hit(output, x, y);
+    let other = if hit.candidates.is_empty() {
+        other_output_match(&scene, output, x, y)
+    } else {
+        None
+    };
+
+    input::click_logical(button, lx, ly, count)?;
+    let (locked, lock_evidence, notes) = lock_notes();
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "summary": format!("clicked {button:?} at ({x}, {y}) on output {output} x{count}"),
+        "action": "click",
+        "button": format!("{button:?}"),
+        "count": count,
+        "requested": {"x": x, "y": y, "output": output},
+        "output": output_json(out),
+        "logical": logical_json(lx, ly),
+        "hit": hit_json(&scene, &hit),
+        "other_output_match": other,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+    }))?)
 }
 
 fn tool_move(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
     let output = output_arg(args);
-    input::move_to(x, y, output)?;
-    Ok(format!("pointer at ({x}, {y}) on output {output}"))
+
+    let scene = Scene::load(true)?;
+    let out = scene.output(output)?;
+    point_in_output(out, x, y)?;
+    let region = input::region_for(out, &scene.regions)?.region;
+    let (lx, ly) = (
+        region.x + f64::from(x) / region.scale,
+        region.y + f64::from(y) / region.scale,
+    );
+    let hit = scene.hit(output, x, y);
+    let other = if hit.candidates.is_empty() {
+        other_output_match(&scene, output, x, y)
+    } else {
+        None
+    };
+
+    input::move_logical(lx, ly)?;
+    let (locked, lock_evidence, notes) = lock_notes();
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "summary": format!("pointer at ({x}, {y}) on output {output}"),
+        "action": "move",
+        "requested": {"x": x, "y": y, "output": output},
+        "output": output_json(out),
+        "logical": logical_json(lx, ly),
+        "hit": hit_json(&scene, &hit),
+        "other_output_match": other,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+    }))?)
 }
 
 fn tool_scroll(args: &Value) -> Result<String> {
@@ -776,10 +1300,171 @@ fn tool_scroll(args: &Value) -> Result<String> {
     let y = int_arg(args, "y")?;
     let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
     let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
-
     let output = output_arg(args);
-    input::scroll(x, y, output, dx, dy)?;
-    Ok(format!("scrolled dx={dx} dy={dy} at ({x}, {y}) on output {output}"))
+
+    let scene = Scene::load(true)?;
+    let out = scene.output(output)?;
+    point_in_output(out, x, y)?;
+    let region = input::region_for(out, &scene.regions)?.region;
+    let (lx, ly) = (
+        region.x + f64::from(x) / region.scale,
+        region.y + f64::from(y) / region.scale,
+    );
+    let hit = scene.hit(output, x, y);
+    let other = if hit.candidates.is_empty() {
+        other_output_match(&scene, output, x, y)
+    } else {
+        None
+    };
+
+    input::scroll_logical(lx, ly, dx, dy)?;
+    let (locked, lock_evidence, notes) = lock_notes();
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "summary": format!("scrolled dx={dx} dy={dy} at ({x}, {y}) on output {output}"),
+        "action": "scroll",
+        "dx": dx,
+        "dy": dy,
+        "requested": {"x": x, "y": y, "output": output},
+        "output": output_json(out),
+        "logical": logical_json(lx, ly),
+        "hit": hit_json(&scene, &hit),
+        "other_output_match": other,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+    }))?)
+}
+
+fn tool_click_window(args: &Value) -> Result<String> {
+    let needle = window_arg(args, "click_window")?;
+    let x = int_arg(args, "x")?;
+    let y = int_arg(args, "y")?;
+    let button = button_arg(args)?;
+    let count = count_arg(args);
+
+    let windows = toplevel::list()?;
+    let target = toplevel::find(&windows, needle)?;
+    let scene = Scene::from_windows(windows, true)?;
+    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &target.identifier, x, y)?;
+    let window = &scene.windows[index];
+    let out = scene.output(geometry.output_index)?;
+    let hit = scene.hit(geometry.output_index, ox, oy);
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.extend(pointer_notes(window, &geometry));
+
+    input::click_logical(button, lx, ly, count)?;
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "summary": format!(
+            "clicked {button:?} in window {:?} at image ({x}, {y}) = output {} pixel ({ox}, {oy}) x{count}",
+            window.title, geometry.output_index
+        ),
+        "action": "click",
+        "button": format!("{button:?}"),
+        "count": count,
+        "window": window_ref(window),
+        "output": output_json(out),
+        "scale": geometry.region.scale,
+        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "point": {
+            "image": {"x": x, "y": y},
+            "output": {"x": ox, "y": oy},
+            "logical": logical_json(lx, ly),
+        },
+        "hit": hit_json(&scene, &hit),
+        "on_active_workspace": window.on_active_workspace,
+        "workspaces": window.workspaces,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+    }))?)
+}
+
+fn tool_move_window(args: &Value) -> Result<String> {
+    let needle = window_arg(args, "move_window")?;
+    let x = int_arg(args, "x")?;
+    let y = int_arg(args, "y")?;
+
+    let windows = toplevel::list()?;
+    let target = toplevel::find(&windows, needle)?;
+    let scene = Scene::from_windows(windows, true)?;
+    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &target.identifier, x, y)?;
+    let window = &scene.windows[index];
+    let out = scene.output(geometry.output_index)?;
+    let hit = scene.hit(geometry.output_index, ox, oy);
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.extend(pointer_notes(window, &geometry));
+
+    input::move_logical(lx, ly)?;
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "summary": format!(
+            "pointer at window {:?} image ({x}, {y}) = output {} pixel ({ox}, {oy})",
+            window.title, geometry.output_index
+        ),
+        "action": "move",
+        "window": window_ref(window),
+        "output": output_json(out),
+        "scale": geometry.region.scale,
+        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "point": {
+            "image": {"x": x, "y": y},
+            "output": {"x": ox, "y": oy},
+            "logical": logical_json(lx, ly),
+        },
+        "hit": hit_json(&scene, &hit),
+        "on_active_workspace": window.on_active_workspace,
+        "workspaces": window.workspaces,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+    }))?)
+}
+
+fn tool_scroll_window(args: &Value) -> Result<String> {
+    let needle = window_arg(args, "scroll_window")?;
+    let x = int_arg(args, "x")?;
+    let y = int_arg(args, "y")?;
+    let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
+
+    let windows = toplevel::list()?;
+    let target = toplevel::find(&windows, needle)?;
+    let scene = Scene::from_windows(windows, true)?;
+    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &target.identifier, x, y)?;
+    let window = &scene.windows[index];
+    let out = scene.output(geometry.output_index)?;
+    let hit = scene.hit(geometry.output_index, ox, oy);
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.extend(pointer_notes(window, &geometry));
+
+    input::scroll_logical(lx, ly, dx, dy)?;
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "summary": format!(
+            "scrolled dx={dx} dy={dy} in window {:?} at image ({x}, {y}) = output {} pixel ({ox}, {oy})",
+            window.title, geometry.output_index
+        ),
+        "action": "scroll",
+        "dx": dx,
+        "dy": dy,
+        "window": window_ref(window),
+        "output": output_json(out),
+        "scale": geometry.region.scale,
+        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "point": {
+            "image": {"x": x, "y": y},
+            "output": {"x": ox, "y": oy},
+            "logical": logical_json(lx, ly),
+        },
+        "hit": hit_json(&scene, &hit),
+        "on_active_workspace": window.on_active_workspace,
+        "workspaces": window.workspaces,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "notes": notes,
+    }))?)
 }
 
 fn tool_type_text(args: &Value) -> Result<String> {
@@ -833,7 +1518,10 @@ fn tool_clipboard_write(args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .context("missing text")?;
     clipboard::write(text)?;
-    Ok(format!("clipboard set ({} characters)", text.chars().count()))
+    Ok(format!(
+        "clipboard set ({} characters)",
+        text.chars().count()
+    ))
 }
 
 fn tool_clipboard_read() -> Result<String> {
@@ -889,7 +1577,10 @@ pub fn doctor() -> Result<()> {
     let windows = toplevel::list().context("list windows")?;
     println!("toplevels: {}", windows.len());
     for window in &windows {
-        println!("  {} [{}] {}", window.app_id, window.identifier, window.title);
+        println!(
+            "  {} [{}] {}",
+            window.app_id, window.identifier, window.title
+        );
     }
     for index in 0..outputs.len() {
         match capture::capture(index) {

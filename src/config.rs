@@ -35,7 +35,8 @@ fn config_root() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
-            let home = std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
+            let home =
+                std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
             PathBuf::from(home).join(".config")
         }
     };
@@ -120,8 +121,7 @@ pub fn write(app: &str, key: &str, value: Option<&str>) -> Result<Value> {
 
     match value {
         Some(raw) => {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             write_atomic(&path, raw)?;
             Ok(json!({
                 "app": app,

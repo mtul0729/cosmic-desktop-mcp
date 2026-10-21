@@ -7,7 +7,7 @@
 //! is no way to ask it. Callers that need other layouts should use the
 //! clipboard.
 
-use anyhow::{Result, bail, Context as _};
+use anyhow::{Context as _, Result, bail};
 
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
@@ -154,9 +154,11 @@ pub fn parse_chord(chord: &str) -> Result<Vec<u16>> {
             "end" => 107,
             "pageup" => 104,
             "pagedown" => 109,
-            single if single.chars().count() == 1 => keycode_for(single.chars().next().unwrap())
-                .with_context(|| format!("unsupported key {part:?}"))?
-                .0,
+            single if single.chars().count() == 1 => {
+                keycode_for(single.chars().next().unwrap())
+                    .with_context(|| format!("unsupported key {part:?}"))?
+                    .0
+            }
             other => bail!("unknown key {other:?}"),
         };
         codes.push(code);

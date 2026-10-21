@@ -1,14 +1,16 @@
 ---
 name: cosmic-desktop-ops
-description: Use when driving or debugging a COSMIC (Wayland) desktop through the cosmic-desktop-mcp tools — screenshots, clicking, typing, scrolling, window geometry and focus, panel applets, cosmic-config. Covers the coordinate convention (screenshot pixels, per output), the focus and occlusion traps that make actions look like they failed, and the approaches already known to be dead on COSMIC (AT-SPI, SIGTERM-ing applets). Load before scripting a desktop task, or when a click or paste "did nothing".
+description: Use when driving or debugging a COSMIC (Wayland) desktop through the cosmic-desktop-mcp tools — screenshots, clicking, typing, scrolling, window geometry and focus, panel applets, cosmic-config. Covers the three coordinate spaces (output screenshot pixels, window image pixels, logical) and which tool takes which, the focus and occlusion traps that make actions look like they failed, and the approaches already known to be dead on COSMIC (AT-SPI, SIGTERM-ing applets). Load before scripting a desktop task, or when a click or paste "did nothing".
 agent_created: true
 ---
 
 # Driving and debugging a COSMIC desktop
 
 These tools are not general-purpose desktop automation. They implement one loop:
-**look → locate → act → look again**, with every coordinate living in the
-screenshot pixel space of one specific output.
+**look → locate → act → look again**, with every coordinate living in one of
+three explicitly named spaces. For anything inside a window, the point comes
+from `screenshot_window` and goes to `click_window`; no output index, no
+arithmetic.
 
 Protocol-level findings (how `zcosmic_toplevel_info_v1` pushes geometry, why
 cosmic-panel does not supervise its applets) live in the `cosmic-desktop-mcp`
@@ -36,34 +38,49 @@ resolution and scale, and whether the EIS session is already authorized. The
 `env_info` opens no EIS session and shows no permission dialog, so it is free to
 call.
 
-## Coordinates: there is exactly one convention
+## Coordinates: three spaces, and one rule
 
-- Every `x`/`y` is a **screenshot pixel**. Screenshots are not scaled, so **never
-  multiply by 1.25 or 1.5** yourself.
-- Coordinates **belong to one output**. `click {x, y, output: n}` only makes
-  sense with the `n` the screenshot was taken from. Two monitors, two unrelated
-  coordinate spaces; the wrong `n` clicks the same pixel on the other screen.
-- Do not derive scale from `wl_output.scale`. COSMIC always reports 2 there
-  (integer protocol); the real ratio (1.25 / 1.5) only exists inside the EIS
-  region the tool reads.
+- **output screenshot pixels** — what `screenshot {output}` returns. `click` /
+  `move` / `scroll` take these **and the matching `output` index**. The output
+  defaults to 0 and is never inferred from x/y, so a point from another monitor's
+  screenshot silently clicks the wrong screen.
+- **window image pixels** — what `screenshot_window {window}` returns. Pass a
+  point straight to `click_window` / `move_window` / `scroll_window`; they
+  resolve the window's output and crop origin themselves.
+- **logical** — the compositor's desktop coordinates. No tool takes them.
 
-**Clicking inside a window.** `screenshot_window` returns the answer directly:
+Never add a window origin to a point and call `click`. The window tools exist so
+that arithmetic cannot go wrong. If a pointer reply contains
+`other_output_match`, you used the wrong output's screenshot space — the point
+is empty here but inside a window there.
+
+Do not derive scale from `wl_output.scale`. COSMIC always reports 2 there
+(integer protocol); the real ratio (1.25 / 1.5) only exists inside the EIS
+region the tool reads, and `screenshot_window` reports it as `scale`.
+
+**Clicking inside a window:**
 
 ```
-.../window-<ts>.png
-1265x1380 from output_index=1 (DP-2), window "kitty"
-window origin in that output's screenshot pixels: x=1285 y=50
-to click something at (dx,dy) inside this image use click(x=1285+dx, y=50+dy, output=1)
+screenshot_window {window: "kitty"}
+→ { "image": {"width": 942, "height": 1008},
+    "logical": {"x": 644, "y": 40, "width": 628, "height": 672},
+    "pixels":  {"x": 966, "y": 60, "width": 942, "height": 1008},
+    "origin":  {"x": 966, "y": 60},
+    "output":  {"index": 1, "name": "eDP-1", "scale": 1.5},
+    "on_active_workspace": true, ... }
+
+click_window {window: "kitty", x: 468, y: 84}
 ```
 
-Copy that line. The returned origin is already in that output's pixel space, so
-there is no arithmetic to do.
+Read the point off the image and pass it unchanged. `click_window` converts it
+to output pixels and logical coordinates and says which ones it used.
 
 ## The loop
 
 1. `screenshot {output}` → open the PNG with the Read tool and actually look at it;
 2. pick a pixel coordinate (what you see on the image *is* the coordinate);
-3. `click` / `type_text` / `key` / `scroll`;
+3. `click_window` inside a window (or `click` for the desktop), then `type_text` /
+   `key` / `scroll_window`;
 4. **take another screenshot to confirm.** Never assume an action landed: the
    compositor is free to ignore requests (see below).
 
@@ -103,6 +120,12 @@ keystrokes does.**
   fullscreen, kitty's geometry still sits at its tiled coordinates, so cropping
   by it returns the mpv pixels covering that area. **`activate` first, then
   capture.**
+- **Workspace membership is reported.** `workspaces` lists the group, name and
+  `active` flag; `on_active_workspace` is the short answer. When it is `false`,
+  the window's geometry describes a workspace the output is not showing, so a
+  click there hits whatever is visible instead — `click_window` warns about
+  this, but check before trusting a screenshot. `null` means the compositor did
+  not expose membership, not that the window is on nothing.
 - **The first enumeration may take ~600 ms before geometry appears.** The
   compositor pushes the initial state from its frame-commit path, so an idle
   desktop waits for the next frame. That is by design, not a hang.
@@ -117,11 +140,12 @@ keystrokes does.**
 
 When the session is locked the tools do not fail loudly — they mislead:
 
-- full-screen `screenshot` **times out** with "timed out after 5s" (the
-  compositor offers no frames),
-- `screenshot_window` still "succeeds" but the crop is a rectangle of **lock
-  screen pixels**, because the window's geometry is unaffected by what covers
-  it,
+- `screenshot` now reports `screen_locked` (from logind) and `lock_evidence`;
+  when capture is suspended it still times out with "timed out after 5s", and
+  the error carries the lock state,
+- `screenshot_window` also reports `screen_locked`, but the crop can still be a
+  rectangle of **lock screen pixels**, because the window's geometry is
+  unaffected by what covers it,
 - every window looks frozen: clicks land nowhere useful, and activating does
   nothing.
 
@@ -187,16 +211,18 @@ raw RON.
 
 | Symptom | Sequence |
 |---|---|
-| A widget will not accept a click | `screenshot` → pick pixel → `window_action activate` → `screenshot_window` for the origin → `click(origin+dx)` → screenshot again |
+| A widget will not accept a click | `window_action activate` → `screenshot_window` → pick (x,y) off that image → `click_window {window, x, y}` → screenshot again |
 | Text lands in the wrong window | `window_action activate` → `type_text` |
 | A window screenshot shows something else | It is occluded or on another workspace: activate, then `screenshot_window` |
-| The click does nothing at all | Check the `output` index, check the window's `output.name` in `list_windows`, check the coordinate is inside the window |
+| The click does nothing at all | Read the reply: `hit.window` (null = desktop), `on_active_workspace`, and `other_output_match` (wrong output's screenshot space). Use `click_window` for window images |
 | An applet looks wrong | `applets` for the PID → `app_logs` → `config_read` the config → `restart_applet` if needed (and say the whole section was rebuilt) |
 | Unsure about the desktop topology | `env_info` (no side effects). Do not guess |
 
 ## Anti-patterns
 
 - Hardcoding absolute coordinates — breaks on any monitor or scale change.
+- Adding a `screenshot_window` origin to a point and calling `click` — use
+  `click_window` and pass the image point unchanged.
 - `click` followed directly by `type_text`.
 - Restarting applets with `kill`, or treating `restart_applet` as a targeted restart.
 - Writing cosmic-config without keeping the previous value.

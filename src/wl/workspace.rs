@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum, event_created_child,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
     backend::ObjectId,
+    event_created_child,
     globals::{GlobalListContents, registry_queue_init},
     protocol::wl_registry,
 };
@@ -139,8 +140,10 @@ impl Dispatch<ExtWorkspaceHandleV1, ()> for State {
             ext_workspace_handle_v1::Event::Name { name } => entry.name = Some(name),
             ext_workspace_handle_v1::Event::Coordinates { coordinates } => {
                 entry.coordinates = coordinates
-                    .chunks_exact(4)
-                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_ne_bytes(*chunk))
                     .collect();
             }
             ext_workspace_handle_v1::Event::State { state: flags } => {
@@ -205,7 +208,11 @@ fn collect(state: State) -> Vec<Workspace> {
         }
     }
     out.retain(|workspace| workspace.handle.is_some());
-    out.sort_by(|a, b| a.group.cmp(&b.group).then(a.coordinates.cmp(&b.coordinates)));
+    out.sort_by(|a, b| {
+        a.group
+            .cmp(&b.group)
+            .then(a.coordinates.cmp(&b.coordinates))
+    });
     out
 }
 
