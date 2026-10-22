@@ -664,7 +664,7 @@ impl Drop for Snapshot {
 }
 
 fn connect(with_manager: bool) -> Result<Snapshot> {
-    let conn = Connection::connect_to_env().context("connect to WAYLAND_DISPLAY")?;
+    let conn = super::connect()?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
     let qh = queue.handle();
 

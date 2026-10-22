@@ -258,7 +258,7 @@ pub fn outputs() -> Result<Vec<OutputInfo>> {
 }
 
 fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
-    let conn = Connection::connect_to_env().context("connect to WAYLAND_DISPLAY")?;
+    let conn = super::connect()?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
     let qh = queue.handle();
 
@@ -278,7 +278,7 @@ fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
 
 /// Captures `output_index`. Rows are returned top-down.
 pub fn capture(output_index: usize) -> Result<Shot> {
-    let conn = Connection::connect_to_env().context("connect to WAYLAND_DISPLAY")?;
+    let conn = super::connect()?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
     let qh = queue.handle();
     let mut state = State::default();

@@ -346,6 +346,27 @@ nix build github:mtul0729/cosmic-desktop-mcp
 
 The result is `result/bin/cosmic-desktop-mcp`.
 
+### MCP client environment
+
+This is a Wayland client, so its stdio server needs the desktop session environment.
+MCP clients are not required to inherit their full environment when spawning a local
+server. Codex deliberately starts stdio servers with a cleared environment and only
+forwards variables named in `env_vars`.
+
+For Codex, configure it with:
+
+```toml
+[mcp_servers.cosmic-desktop]
+command = "cosmic-desktop-mcp"
+env_vars = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_ID"]
+```
+
+`WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` are required. `XDG_SESSION_ID` lets
+`screenshot` ask logind whether the session is locked; without it, `screen_locked`
+is `null`. If you override `XDG_CONFIG_HOME` or `XDG_STATE_HOME`, forward those
+too. Restart the Codex session after changing `env_vars`: already-running MCP
+servers keep their original environment.
+
 To wire it into WorkBuddy (`~/.workbuddy/mcp.json`):
 
 ```json
@@ -435,6 +456,10 @@ Inside an MCP session the agent calls `env_info` and gets JSON:
   how the agent diagnoses "I clicked and nothing happened".
 - `notes`: the coordinate convention (tools take screenshot pixels; the logical
   conversion happens inside).
+
+If `env_info` reports `missing Wayland session environment`, the desktop is not
+the problem: the MCP client omitted `WAYLAND_DISPLAY` or `XDG_RUNTIME_DIR`.
+Use the `env_vars` configuration above and restart the client.
 
 ### When the status goes stale
 

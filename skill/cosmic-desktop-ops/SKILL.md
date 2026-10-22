@@ -28,6 +28,11 @@ through `/dev/uinput` or X11: on COSMIC they either cannot see an EIS region (so
 every coordinate is wrong) or do nothing at all, which turns "tool not
 installed" into a fake "this UI is unclickable" bug.
 
+If the tools exist but `env_info` reports `missing Wayland session environment`,
+fix the MCP client configuration. It must forward `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR` (and preferably `XDG_SESSION_ID`), then restart the server.
+This is an MCP launch-environment failure, not a compositor or tool bug.
+
 ## Step 1: `env_info` for the topology
 
 Once at the start of a session, and again after plugging in a monitor or

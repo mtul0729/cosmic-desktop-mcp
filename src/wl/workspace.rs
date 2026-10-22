@@ -180,7 +180,7 @@ type Session = (
 );
 
 fn connect() -> Result<Session> {
-    let conn = Connection::connect_to_env().context("connect to WAYLAND_DISPLAY")?;
+    let conn = super::connect()?;
     let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
     let qh = queue.handle();
     let manager: ExtWorkspaceManagerV1 = globals
