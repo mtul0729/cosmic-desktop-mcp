@@ -252,6 +252,28 @@ The MCP tool layer switched to EIS on 2026-10-17: `src/input.rs` speaks EIS only
 session is long-lived (`EiEvent` is not `Send`, so it owns a thread fed by a command
 channel), the key table lives in `src/keymap.rs`, and `/dev/uinput` is gone entirely.
 
+## Releasing
+
+The version is written in three places — `Cargo.toml`, the `cosmic-desktop-mcp` entry in
+`Cargo.lock`, and `version` in `flake.nix` — and a release tag has to match all of them.
+`scripts/bump-version.sh` writes the three; `scripts/check-version.sh` proves they agree.
+CI runs the check on every push, and `release.yml` runs it again against the tag.
+
+```bash
+scripts/bump-version.sh 0.2.1
+jj describe -m 'release: v0.2.1'        # or git commit -am
+jj bookmark set main -r @ && jj git push -b main
+git tag -a v0.2.1 -m 'v0.2.1' && git push origin refs/tags/v0.2.1
+```
+
+Pushing the tag runs `release.yml`: it checks the tag against the version, evaluates and
+builds the flake (which pushes the result to the cache), and publishes a GitHub release
+with generated notes.
+
+The release carries no binary on purpose. The package is a Nix wrapper around the Rust
+binary, so a tarball of `result/bin/cosmic-desktop-mcp` would reference store paths that do
+not exist on the machine that unpacks it. What ships is the tag, the cache entry and the
+flake: `nix run github:mtul0729/cosmic-desktop-mcp`.
 ## Known limitations
 
 1. **`type_text` always goes through the clipboard.** Synthesized keycodes reach the input
