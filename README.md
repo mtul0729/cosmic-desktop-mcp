@@ -302,41 +302,32 @@ flake: `nix run github:mtul0729/cosmic-desktop-mcp`.
    and it applies the layout, which cannot be queried; for non-US layouts, use the
    clipboard.
 
-## Why hand-write the MCP protocol layer instead of using an SDK
+## MCP protocol layer
 
-The protocol layer in `src/mcp.rs` is hand-written, about 60 lines: read stdin line by
-line, parse JSON-RPC, dispatch on `method`, write replies back line by line. It implements
-`initialize` / `ping` / `tools/list` / `tools/call` and nothing else.
+The server uses the official Rust SDK, [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)
+3.8 with its `server` and `transport-io` features. `ServerHandler` now owns JSON-RPC framing,
+the lifecycle and notifications, protocol-version negotiation, and the stdio transport.
+`src/mcp.rs` is left with the part that is specific to this server: the tool catalogue and
+their implementations.
 
-The reason is dependency weight: the official Rust SDK, `rmcp` (v3.5.1, 1.0 due 2026-03,
-supporting spec 2026-07-28), brings its own tokio runtime abstraction and schemars, which
-would make crane's `cargoArtifacts` hash noticeably heavier — while the tools are still
-changing fast, so cache reuse would drop.
+The server supports every protocol revision known to rmcp 3.8, from `2024-11-05` through
+`2026-07-28`, and negotiates the client's requested version. Tool calls run on Tokio's
+blocking pool because Wayland, the portal, image encoding and the shell-based helpers are
+blocking APIs. The tool catalogue is still authored as JSON Schema and converted to
+`rmcp::model::Tool` at startup. That is deliberate: the descriptions encode COSMIC-specific
+coordinate and visibility traps, and a full `#[tool]` / `schemars` rewrite is a separate
+change from replacing the protocol implementation.
 
-**The cost is real**, not "good enough anyway":
+Two limitations remain and should not be inferred from the SDK alone:
 
-| What is missing | Consequence |
-|---|---|
-| `protocolVersion` pinned to `2024-11-05` | Newer clients negotiate down; no `server/discover`, long-running tasks or subscriptions |
-| No progress notification | The client sees nothing while a screenshot is taken or a portal authorization is awaited |
-| No cancellation | A dispatched call cannot be cancelled (the first EIS authorization has a 60 s timeout) |
-| Hand-written schema | Maintained apart from the implementation; the `scroll` `dy` description once said the opposite of the code |
+- tool execution does not emit progress notifications while capturing or waiting for portal
+  authorization;
+- a running tool call is not cooperatively cancellable after it has entered the blocking
+  Wayland/portal code.
 
-**When to switch to `rmcp`** — any one of these ends the saving:
-
-1. Progress feedback is needed (batch screenshots, waiting on authorization)
-2. Cancellation is needed
-3. Several clients must be served at once
-4. Streamable HTTP transport is needed
-5. The tool count keeps growing and hand-written schemas stop paying
-
-**Migration path**, not necessarily all at once:
-
-1. Move tool schemas to derives over Rust structs (bring in `schemars` alone, not `rmcp`)
-   and eliminate schema drift — that is what caused the `dy` incident.
-2. When progress / long tasks / HTTP are genuinely needed, switch to `rmcp`'s `#[tool]` +
-   `ServerHandler`; the `tool_*` function signatures inside `dispatch()` carry over almost
-   unchanged.
+Both need the individual tool implementations to expose checkpoints or async backends.
+Moving to rmcp makes those additions possible without replacing the transport again; it
+does not make blocking operations cancellable by itself.
 
 ## Install
 

@@ -31,7 +31,8 @@ cosmic-protocols = { version = "0.2", default-features = false, features = ["cli
 # compile (ashpd 0.13.13).
 ashpd = { version = "0.13", features = ["remote_desktop", "screencast"] }
 reis = "0.7"
-tokio = { version = "1", features = ["rt", "time"] }
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [profile.release]
 lto = "thin"

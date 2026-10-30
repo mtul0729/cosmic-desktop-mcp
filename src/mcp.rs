@@ -1,15 +1,20 @@
-//! Minimal MCP server over stdio.
-//!
-//! Hand-rolled JSON-RPC rather than an SDK dependency: the wire surface an
-//! agent needs is `initialize` / `tools/list` / `tools/call`, and keeping the
-//! dependency tree small is what makes the crane `cargoArtifacts` cheap to
-//! cache while the tools are still being iterated on.
+//! MCP server over stdio, using the official Rust SDK.
 
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+        Tool,
+    },
+    service::RequestContext,
+    transport::io::stdio,
+};
 use serde_json::{Value, json};
 
 use crate::applets;
@@ -23,72 +28,74 @@ use crate::wl;
 use crate::wl::toplevel::{self, Window};
 use crate::wl::{capture, workspace};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
-
 pub fn serve() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
-    for line in stdin.lock().lines() {
-        let line = line.context("read stdin")?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let request: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("cosmic-desktop-mcp: bad JSON: {err}");
-                continue;
-            }
-        };
-
-        // Notifications carry no id and must not be answered.
-        let Some(id) = request.get("id").cloned() else {
-            continue;
-        };
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        let response = match dispatch(method, request.get("params")) {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err(err) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32000, "message": format!("{err:#}")}
-            }),
-        };
-
-        serde_json::to_writer(&mut stdout, &response).context("encode response")?;
-        stdout.write_all(b"\n").context("write newline")?;
-        stdout.flush().context("flush stdout")?;
-    }
-
-    Ok(())
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create tokio runtime")?
+        .block_on(async {
+            let running = CosmicServer::default()
+                .serve(stdio())
+                .await
+                .context("initialize MCP server")?;
+            running.waiting().await.context("run MCP server")?;
+            Ok(())
+        })
 }
 
-fn dispatch(method: &str, params: Option<&Value>) -> Result<Value> {
-    match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
-            "serverInfo": {
-                "name": "cosmic-desktop-mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        })),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tool_definitions()})),
-        "tools/call" => call_tool(params),
-        other => bail!("unsupported method {other:?}"),
+#[derive(Clone, Default)]
+struct CosmicServer {
+    // The hand-written server handled one request at a time. Keep that
+    // guarantee now that rmcp can dispatch requests concurrently: EIS and the
+    // clipboard helpers are process-wide state, not independent operations.
+    tool_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ServerHandler for CosmicServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("cosmic-desktop-mcp", env!("CARGO_PKG_VERSION")),
+        )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, McpError> {
+        let tools = tool_definitions().map_err(mcp_internal)?;
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResponse, McpError> {
+        let _guard = self.tool_lock.lock().await;
+        let name = request.name.into_owned();
+        let args = Value::Object(request.arguments.unwrap_or_default());
+        let outcome = tokio::task::spawn_blocking(move || dispatch_tool(&name, &args))
+            .await
+            .map_err(|err| mcp_internal(anyhow::anyhow!("tool task failed: {err}")))?;
+
+        Ok(tool_call_result(outcome).into())
     }
 }
 
-fn tool_definitions() -> Value {
-    json!([
+fn mcp_internal(err: anyhow::Error) -> McpError {
+    McpError::internal_error(format!("{err:#}"), None)
+}
+
+fn tool_call_result(outcome: Result<String>) -> CallToolResult {
+    match outcome {
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(err) => CallToolResult::error(vec![ContentBlock::text(format!("{err:#}"))]),
+    }
+}
+
+fn tool_definitions() -> Result<Vec<Tool>> {
+    serde_json::from_value(json!([
         {
             "name": "screenshot",
             "description": "Capture one output and save it as a PNG. Returns the path, the image \
@@ -461,51 +468,34 @@ fn tool_definitions() -> Value {
                 "required": ["app", "key"]
             }
         }
-    ])
+    ]))
+    .context("built-in tool definitions do not match rmcp::model::Tool")
 }
 
-fn call_tool(params: Option<&Value>) -> Result<Value> {
-    let params = params.context("tools/call without params")?;
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .context("tools/call without name")?;
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    let outcome = match name {
-        "screenshot" => tool_screenshot(&args),
+fn dispatch_tool(name: &str, args: &Value) -> Result<String> {
+    match name {
+        "screenshot" => tool_screenshot(args),
         "env_info" => tool_env_info(),
         "list_windows" => tool_list_windows(),
-        "screenshot_window" => tool_screenshot_window(&args),
-        "window_action" => tool_window_action(&args),
-        "click" => tool_click(&args),
-        "move" => tool_move(&args),
-        "scroll" => tool_scroll(&args),
-        "click_window" => tool_click_window(&args),
-        "move_window" => tool_move_window(&args),
-        "scroll_window" => tool_scroll_window(&args),
-        "type_text" => tool_type_text(&args),
-        "clipboard_write" => tool_clipboard_write(&args),
+        "screenshot_window" => tool_screenshot_window(args),
+        "window_action" => tool_window_action(args),
+        "click" => tool_click(args),
+        "move" => tool_move(args),
+        "scroll" => tool_scroll(args),
+        "click_window" => tool_click_window(args),
+        "move_window" => tool_move_window(args),
+        "scroll_window" => tool_scroll_window(args),
+        "type_text" => tool_type_text(args),
+        "clipboard_write" => tool_clipboard_write(args),
         "clipboard_read" => tool_clipboard_read(),
-        "key" => tool_key(&args),
-        "workspaces" => tool_workspaces(&args),
+        "key" => tool_key(args),
+        "workspaces" => tool_workspaces(args),
         "applets" => tool_applets(),
-        "restart_applet" => tool_restart_applet(&args),
-        "app_logs" => tool_app_logs(&args),
-        "config_read" => tool_config_read(&args),
-        "config_write" => tool_config_write(&args),
+        "restart_applet" => tool_restart_applet(args),
+        "app_logs" => tool_app_logs(args),
+        "config_read" => tool_config_read(args),
+        "config_write" => tool_config_write(args),
         other => bail!("unknown tool {other:?}"),
-    };
-
-    match outcome {
-        Ok(text) => Ok(json!({
-            "content": [{"type": "text", "text": text}],
-            "isError": false
-        })),
-        Err(err) => Ok(json!({
-            "content": [{"type": "text", "text": format!("{err:#}")}],
-            "isError": true
-        })),
     }
 }
 
@@ -632,7 +622,8 @@ fn tool_env_info() -> Result<String> {
 
     Ok(serde_json::to_string_pretty(&json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": ProtocolVersion::LATEST.as_str(),
+        "protocol_versions": ProtocolVersion::KNOWN_VERSIONS,
         "input": {
             "backend": "eis",
             "connected": session.is_some(),
@@ -1598,4 +1589,75 @@ pub fn doctor() -> Result<()> {
     }
     print!("{}", input::describe().context("probe the input backend")?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rmcp_advertises_the_expected_server_and_tool_capability() {
+        let info = ServerHandler::get_info(&CosmicServer::default());
+        assert_eq!(info.server_info.name, "cosmic-desktop-mcp");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(info.capabilities.tools.is_some());
+        assert!(ProtocolVersion::KNOWN_VERSIONS.contains(&ProtocolVersion::LATEST));
+    }
+
+    #[test]
+    fn every_tool_definition_deserializes_as_an_rmcp_tool() {
+        let tools = tool_definitions().expect("tool definitions must match rmcp::model::Tool");
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            [
+                "screenshot",
+                "env_info",
+                "list_windows",
+                "screenshot_window",
+                "window_action",
+                "click",
+                "move",
+                "scroll",
+                "click_window",
+                "move_window",
+                "scroll_window",
+                "type_text",
+                "clipboard_write",
+                "clipboard_read",
+                "key",
+                "workspaces",
+                "applets",
+                "restart_applet",
+                "app_logs",
+                "config_read",
+                "config_write",
+            ]
+        );
+        for tool in tools {
+            assert_eq!(
+                tool.input_schema.get("type").and_then(Value::as_str),
+                Some("object"),
+                "{} must have an object input schema",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn rmcp_tool_results_keep_tool_errors_visible_to_the_client() {
+        let success = tool_call_result(Ok("ok".to_string()));
+        assert_eq!(success.is_error, Some(false));
+        assert_eq!(
+            success.content[0].as_text().map(|text| text.text.as_str()),
+            Some("ok")
+        );
+
+        let failure = tool_call_result(Err(anyhow::anyhow!("tool failed: detail")));
+        assert_eq!(failure.is_error, Some(true));
+        assert_eq!(
+            failure.content[0].as_text().map(|text| text.text.as_str()),
+            Some("tool failed: detail")
+        );
+    }
 }
