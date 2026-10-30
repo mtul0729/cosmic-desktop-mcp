@@ -12,6 +12,8 @@
 
 use std::process::Command;
 
+use crate::session;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockState {
     Locked,
@@ -37,10 +39,9 @@ impl LockReport {
 }
 
 pub fn detect() -> LockReport {
-    let Some(session) = std::env::var_os("XDG_SESSION_ID") else {
-        return unknown("XDG_SESSION_ID is not set, so logind cannot be asked about this session");
+    let Some(session) = session::login_session_id() else {
+        return unknown("neither XDG_SESSION_ID nor loginctl named the user's graphical session");
     };
-    let session = session.to_string_lossy().into_owned();
 
     match Command::new("loginctl")
         .args(["show-session", &session, "-p", "LockedHint"])

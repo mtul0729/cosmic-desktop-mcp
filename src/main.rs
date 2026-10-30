@@ -18,6 +18,7 @@ mod input;
 mod keymap;
 mod lockstate;
 mod mcp;
+mod session;
 mod wl;
 
 use std::process::ExitCode;

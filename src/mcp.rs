@@ -19,6 +19,7 @@ use crate::coords::{self, HitCandidate, HitResult, WindowGeometry};
 use crate::input;
 use crate::keymap::Button;
 use crate::lockstate;
+use crate::wl;
 use crate::wl::toplevel::{self, Window};
 use crate::wl::{capture, workspace};
 
@@ -1554,15 +1555,16 @@ fn int_arg(args: &Value, key: &str) -> Result<i32> {
 }
 
 fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    crate::session::runtime_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
 /// `--doctor` output: proves the three moving parts work without running a
 /// tool call against a live desktop.
 pub fn doctor() -> Result<()> {
-    println!("wayland: {:?}", std::env::var("WAYLAND_DISPLAY"));
+    match wl::socket_path() {
+        Ok(socket) => println!("wayland socket: {}", socket.display()),
+        Err(err) => println!("wayland socket: {err:#}"),
+    }
     let outputs = capture::outputs().context("enumerate outputs")?;
     for output in &outputs {
         println!(

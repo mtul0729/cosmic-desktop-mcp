@@ -348,10 +348,13 @@ The result is `result/bin/cosmic-desktop-mcp`.
 
 ### MCP client environment
 
-This is a Wayland client, so its stdio server needs the desktop session environment.
-MCP clients are not required to inherit their full environment when spawning a local
-server. Codex deliberately starts stdio servers with a cleared environment and only
-forwards variables named in `env_vars`.
+This is a Wayland client. It uses an explicit client environment when one is
+available, but can also discover the logged-in user's session when a long-lived
+service starts it with a cleared environment. It takes `WAYLAND_DISPLAY` when
+set, otherwise the only `wayland-*` socket in `XDG_RUNTIME_DIR` (falling back to
+`/run/user/<uid>`); an ambiguous set of sockets is refused rather than guessed.
+`XDG_SESSION_ID` is read from the environment or from logind's active display
+session.
 
 For Codex, configure it with:
 
@@ -361,11 +364,12 @@ command = "cosmic-desktop-mcp"
 env_vars = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_ID"]
 ```
 
-`WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR` are required. `XDG_SESSION_ID` lets
-`screenshot` ask logind whether the session is locked; without it, `screen_locked`
-is `null`. If you override `XDG_CONFIG_HOME` or `XDG_STATE_HOME`, forward those
-too. Restart the Codex session after changing `env_vars`: already-running MCP
-servers keep their original environment.
+Forwarding the variables is still preferred because it is unambiguous.
+`XDG_SESSION_ID` lets `screenshot` ask logind whether the session is locked; if
+neither it nor logind's display session is available, `screen_locked` is `null`.
+If you override `XDG_CONFIG_HOME` or `XDG_STATE_HOME`, forward those too. Restart
+the Codex session after changing `env_vars`: already-running MCP servers keep
+their original environment.
 
 To wire it into WorkBuddy (`~/.workbuddy/mcp.json`):
 
@@ -457,8 +461,10 @@ Inside an MCP session the agent calls `env_info` and gets JSON:
 - `notes`: the coordinate convention (tools take screenshot pixels; the logical
   conversion happens inside).
 
-If `env_info` reports `missing Wayland session environment`, the desktop is not
-the problem: the MCP client omitted `WAYLAND_DISPLAY` or `XDG_RUNTIME_DIR`.
+If startup reports no Wayland socket, the desktop is not necessarily the
+problem: the MCP client may have omitted the session environment. The server
+auto-discovers a single socket in the user runtime directory; when several
+sockets exist, set `WAYLAND_DISPLAY` explicitly.
 Use the `env_vars` configuration above and restart the client.
 
 ### When the status goes stale
