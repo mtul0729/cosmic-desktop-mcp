@@ -9,8 +9,8 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
-        Tool,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProtocolVersion,
+        ServerCapabilities, ServerConfig, Tool,
     },
     service::RequestContext,
     transport::io::stdio,
@@ -25,7 +25,7 @@ use crate::input;
 use crate::keymap::Button;
 use crate::lockstate;
 use crate::wl;
-use crate::wl::toplevel::{self, Window};
+use crate::wl::toplevel::{self, Rect, Window};
 use crate::wl::{capture, workspace};
 
 pub fn serve() -> Result<()> {
@@ -70,14 +70,41 @@ impl ServerHandler for CosmicServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
         let _guard = self.tool_lock.lock().await;
         let name = request.name.into_owned();
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let outcome = tokio::task::spawn_blocking(move || dispatch_tool(&name, &args))
-            .await
-            .map_err(|err| mcp_internal(anyhow::anyhow!("tool task failed: {err}")))?;
+
+        let progress = if needs_input_authorization(&name) && crate::eis::peek().is_none() {
+            context.meta.get_progress_token().map(|token| {
+                let peer = context.peer.clone();
+                tokio::spawn(async move {
+                    let mut step = 0.0;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        step += 1.0;
+                        let notification = ProgressNotificationParam::new(token.clone(), step)
+                            .with_message(
+                                "waiting for the system RemoteDesktop authorization dialog; ask \
+                                 the human to approve it",
+                            );
+                        if peer.notify_progress(notification).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+        } else {
+            None
+        };
+
+        let outcome = tokio::task::spawn_blocking(move || dispatch_tool(&name, &args)).await;
+        if let Some(progress) = progress {
+            progress.abort();
+        }
+        let outcome =
+            outcome.map_err(|err| mcp_internal(anyhow::anyhow!("tool task failed: {err}")))?;
 
         Ok(tool_call_result(outcome).into())
     }
@@ -87,11 +114,100 @@ fn mcp_internal(err: anyhow::Error) -> McpError {
     McpError::internal_error(format!("{err:#}"), None)
 }
 
-fn tool_call_result(outcome: Result<String>) -> CallToolResult {
-    match outcome {
-        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-        Err(err) => CallToolResult::error(vec![ContentBlock::text(format!("{err:#}"))]),
+struct ToolResponse {
+    text: String,
+    structured: Option<Value>,
+    is_error: bool,
+}
+
+impl ToolResponse {
+    fn success(text: String) -> Self {
+        let structured = serde_json::from_str(&text).ok();
+        Self {
+            text,
+            structured,
+            is_error: false,
+        }
     }
+
+    fn error(structured: Value) -> Self {
+        Self {
+            text: serde_json::to_string_pretty(&structured)
+                .unwrap_or_else(|_| structured.to_string()),
+            structured: Some(structured),
+            is_error: true,
+        }
+    }
+}
+
+fn tool_call_result(outcome: Result<ToolResponse>) -> CallToolResult {
+    let response = match outcome {
+        Ok(response) => response,
+        Err(err) => {
+            let text = format!("{err:#}");
+            let structured = classify_tool_error(&text);
+            ToolResponse {
+                text,
+                structured,
+                is_error: true,
+            }
+        }
+    };
+    let mut result = if response.is_error {
+        CallToolResult::error(vec![ContentBlock::text(response.text)])
+    } else {
+        CallToolResult::success(vec![ContentBlock::text(response.text)])
+    };
+    result.structured_content = response.structured;
+    result
+}
+
+fn classify_tool_error(text: &str) -> Option<Value> {
+    let lower = text.to_ascii_lowercase();
+    let status = if lower.contains("did not come up within") {
+        "authorization_timeout"
+    } else if lower.contains("cancel")
+        || lower.contains("denied")
+        || lower.contains("did not grant the session")
+        || lower.contains("granted no input devices")
+        || lower.contains("was rejected")
+    {
+        "authorization_denied"
+    } else if lower.contains("remote desktop portal")
+        || lower.contains("remotedesktop portal")
+        || lower.contains("connect to eis")
+        || lower.contains("portal session")
+        || lower.contains("org.freedesktop.portal")
+    {
+        "authorization_unavailable"
+    } else {
+        return None;
+    };
+    let next_action = if status == "authorization_unavailable" {
+        "check that the XDG Desktop Portal and its RemoteDesktop backend are running, then retry"
+    } else {
+        "ask the human to approve the system RemoteDesktop authorization dialog, then retry"
+    };
+    Some(json!({
+        "status": status,
+        "message": text,
+        "next_action": next_action,
+    }))
+}
+
+fn needs_input_authorization(tool: &str) -> bool {
+    matches!(
+        tool,
+        "prepare_input"
+            | "click"
+            | "move"
+            | "scroll"
+            | "click_window"
+            | "move_window"
+            | "scroll_window"
+            | "type_text"
+            | "key"
+    )
 }
 
 fn tool_definitions() -> Result<Vec<Tool>> {
@@ -122,6 +238,15 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
+            "name": "prepare_input",
+            "description": "Open or reuse the EIS input session and report its devices and output \
+    regions. This is the only status-like tool with a possible side effect: on first use it may \
+    show the system RemoteDesktop authorization dialog, and a human must approve it. Actual input \
+    tools also open the session on first use, so calling this is optional; use it when you want to \
+    trigger and diagnose authorization before taking an action.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
             "name": "list_windows",
             "description": "List open windows with identifier, title, app_id, COSMIC state \
     (maximized/minimized/activated/fullscreen/sticky), **placement** and **workspace membership**. \
@@ -138,16 +263,12 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         },
         {
             "name": "screenshot_window",
-            "description": "Capture one window: finds the window's output, screenshots it and crops \
-    to the window rect. Returns JSON with the PNG path, the crop size (\"image\"), the window's \
-    \"logical\" rect, its \"pixels\" rect in the output's screenshot space, the crop \"origin\", the \
-    \"output\" (index + name) and the real \"scale\". The returned image is the **window image \
-    pixel** space: pass a point from it straight to click_window / move_window / scroll_window, \
-    which resolve the output and origin themselves. Do not add origin to the coordinates and call \
-    click — that is the mistake this API is shaped to prevent. The crop shows whatever is on screen \
-    in that region: if the window is covered (fullscreen video, another window on top) activate it \
-    with window_action first. May open the input session (and a portal dialog) on first use, because \
-    the crop needs the output's scale factor.",
+            "description": "Capture one window without opening the EIS input session. Prefers the \
+    compositor's direct window capture source; if that is unavailable or not coordinate-safe, it \
+    can use an output crop only when an input session is already open. Returns the PNG path, a \
+    \"coordinates\" object, and capture metadata. Pass that coordinates object unchanged to \
+    click_window / move_window / scroll_window. If the response is a needs_input_session error, \
+    call prepare_input explicitly and take a new screenshot; this tool never opens the portal.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -255,12 +376,10 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         },
         {
             "name": "click_window",
-            "description": "Click at (x,y) in the image returned by screenshot_window for the \
-    named window. The tool resolves the window's output and the crop origin itself: there is no \
-    output index and no arithmetic to get wrong. Use this instead of click for anything inside a \
-    window, because click defaults to output 0 and cannot tell which monitor the coordinates came \
-    from. The reply includes the image size, the output pixel and logical point actually used, and \
-    the window under the point.",
+            "description": "Click at (x,y) in the image returned by screenshot_window. Pass that \
+    result's \"coordinates\" object unchanged: it identifies the screenshot's capture space, image \
+    size and logical window rect. The tool validates freshness, opens/reuses EIS, and resolves the \
+    output pixel and logical point itself. Use this instead of click for anything inside a window.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -276,6 +395,10 @@ fn tool_definitions() -> Result<Vec<Tool>> {
                         "type": "integer",
                         "description": "Pixel y in the image returned by screenshot_window."
                     },
+                    "coordinates": {
+                        "type": "object",
+                        "description": "The coordinates object returned by screenshot_window, unchanged."
+                    },
                     "button": {
                         "type": "string",
                         "enum": ["left", "right", "middle"],
@@ -287,32 +410,14 @@ fn tool_definitions() -> Result<Vec<Tool>> {
                         "description": "1 = single click, 2 = double click. Default 1."
                     }
                 },
-                "required": ["window", "x", "y"]
+                "required": ["window", "x", "y", "coordinates"]
             }
         },
         {
             "name": "move_window",
-            "description": "Move the pointer to (x,y) in the image returned by screenshot_window \
-    for the named window. Resolves the output and crop origin internally; use it instead of move for \
-    a hover inside a window.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "window": {
-                        "type": "string",
-                        "description": "Window identifier, app_id, or exact/unique title substring."
-                    },
-                    "x": {"type": "integer", "description": "Pixel x in the screenshot_window image."},
-                    "y": {"type": "integer", "description": "Pixel y in the screenshot_window image."}
-                },
-                "required": ["window", "x", "y"]
-            }
-        },
-        {
-            "name": "scroll_window",
-            "description": "Scroll the wheel at (x,y) in the image returned by screenshot_window \
-    for the named window. Positive dy scrolls UP, negative down; positive dx scrolls right. Resolves \
-    the output and crop origin internally.",
+            "description": "Move the pointer to (x,y) in the image returned by screenshot_window. \
+    Pass that result's \"coordinates\" object unchanged; the tool validates freshness and resolves \
+    the output and logical point itself.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -322,10 +427,36 @@ fn tool_definitions() -> Result<Vec<Tool>> {
                     },
                     "x": {"type": "integer", "description": "Pixel x in the screenshot_window image."},
                     "y": {"type": "integer", "description": "Pixel y in the screenshot_window image."},
+                    "coordinates": {
+                        "type": "object",
+                        "description": "The coordinates object returned by screenshot_window, unchanged."
+                    }
+                },
+                "required": ["window", "x", "y", "coordinates"]
+            }
+        },
+        {
+            "name": "scroll_window",
+            "description": "Scroll the wheel at (x,y) in the image returned by screenshot_window. \
+    Positive dy scrolls UP, negative down; positive dx scrolls right. Pass that result's \
+    \"coordinates\" object unchanged.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": {
+                        "type": "string",
+                        "description": "Window identifier, app_id, or exact/unique title substring."
+                    },
+                    "x": {"type": "integer", "description": "Pixel x in the screenshot_window image."},
+                    "y": {"type": "integer", "description": "Pixel y in the screenshot_window image."},
+                    "coordinates": {
+                        "type": "object",
+                        "description": "The coordinates object returned by screenshot_window, unchanged."
+                    },
                     "dy": {"type": "integer", "description": "Wheel clicks, vertical."},
                     "dx": {"type": "integer", "description": "Wheel clicks, horizontal."}
                 },
-                "required": ["window", "x", "y"]
+                "required": ["window", "x", "y", "coordinates"]
             }
         },
         {
@@ -472,31 +603,33 @@ fn tool_definitions() -> Result<Vec<Tool>> {
     .context("built-in tool definitions do not match rmcp::model::Tool")
 }
 
-fn dispatch_tool(name: &str, args: &Value) -> Result<String> {
-    match name {
-        "screenshot" => tool_screenshot(args),
-        "env_info" => tool_env_info(),
-        "list_windows" => tool_list_windows(),
-        "screenshot_window" => tool_screenshot_window(args),
-        "window_action" => tool_window_action(args),
-        "click" => tool_click(args),
-        "move" => tool_move(args),
-        "scroll" => tool_scroll(args),
-        "click_window" => tool_click_window(args),
-        "move_window" => tool_move_window(args),
-        "scroll_window" => tool_scroll_window(args),
-        "type_text" => tool_type_text(args),
-        "clipboard_write" => tool_clipboard_write(args),
-        "clipboard_read" => tool_clipboard_read(),
-        "key" => tool_key(args),
-        "workspaces" => tool_workspaces(args),
-        "applets" => tool_applets(),
-        "restart_applet" => tool_restart_applet(args),
-        "app_logs" => tool_app_logs(args),
-        "config_read" => tool_config_read(args),
-        "config_write" => tool_config_write(args),
+fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
+    let response = match name {
+        "screenshot" => ToolResponse::success(tool_screenshot(args)?),
+        "env_info" => ToolResponse::success(tool_env_info()?),
+        "prepare_input" => ToolResponse::success(tool_prepare_input()?),
+        "list_windows" => ToolResponse::success(tool_list_windows()?),
+        "screenshot_window" => tool_screenshot_window(args)?,
+        "window_action" => ToolResponse::success(tool_window_action(args)?),
+        "click" => ToolResponse::success(tool_click(args)?),
+        "move" => ToolResponse::success(tool_move(args)?),
+        "scroll" => ToolResponse::success(tool_scroll(args)?),
+        "click_window" => ToolResponse::success(tool_click_window(args)?),
+        "move_window" => ToolResponse::success(tool_move_window(args)?),
+        "scroll_window" => ToolResponse::success(tool_scroll_window(args)?),
+        "type_text" => ToolResponse::success(tool_type_text(args)?),
+        "clipboard_write" => ToolResponse::success(tool_clipboard_write(args)?),
+        "clipboard_read" => ToolResponse::success(tool_clipboard_read()?),
+        "key" => ToolResponse::success(tool_key(args)?),
+        "workspaces" => ToolResponse::success(tool_workspaces(args)?),
+        "applets" => ToolResponse::success(tool_applets()?),
+        "restart_applet" => ToolResponse::success(tool_restart_applet(args)?),
+        "app_logs" => ToolResponse::success(tool_app_logs(args)?),
+        "config_read" => ToolResponse::success(tool_config_read(args)?),
+        "config_write" => ToolResponse::success(tool_config_write(args)?),
         other => bail!("unknown tool {other:?}"),
-    }
+    };
+    Ok(response)
 }
 
 fn tool_screenshot(args: &Value) -> Result<String> {
@@ -613,8 +746,9 @@ fn tool_env_info() -> Result<String> {
     ];
     if session.is_none() {
         notes.push(
-            "the EIS session is not open yet: the first click opens one and may put a portal \
-             authorization dialog on screen, which a human has to accept"
+            "the EIS session is not open yet. Observation tools do not open it. The first actual \
+             input action, or an explicit prepare_input call, may put a portal authorization \
+             dialog on screen; a human must accept it"
                 .to_string(),
         );
     }
@@ -631,6 +765,48 @@ fn tool_env_info() -> Result<String> {
         },
         "outputs": rows,
         "notes": notes,
+    }))?)
+}
+
+/// Explicitly opens the process-wide EIS session.
+///
+/// Unlike every observation tool, this may put a RemoteDesktop authorization
+/// dialog on screen. Actual input tools keep the same lazy behaviour.
+fn tool_prepare_input() -> Result<String> {
+    let already_open = crate::eis::peek().is_some();
+    let session = crate::eis::session()?;
+    let regions: Vec<Value> = session
+        .regions()
+        .into_iter()
+        .map(|region| {
+            let (physical_width, physical_height) = region.physical_size();
+            json!({
+                "mapping_id": region.mapping_id,
+                "logical": {
+                    "x": region.x,
+                    "y": region.y,
+                    "width": region.width,
+                    "height": region.height,
+                },
+                "physical": {"width": physical_width, "height": physical_height},
+                "scale": region.scale,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&json!({
+        "ready": true,
+        "opened": !already_open,
+        "side_effects": if already_open {
+            Vec::<String>::new()
+        } else {
+            vec![
+                "the RemoteDesktop portal may have shown an authorization dialog before this \
+                 result"
+                    .to_string(),
+            ]
+        },
+        "regions": regions,
+        "detail": session.summary_lines(),
     }))?)
 }
 
@@ -1050,29 +1226,155 @@ fn tool_list_windows() -> Result<String> {
     }))?)
 }
 
-/// Crops the window out of a screenshot of its output and reports the same
-/// geometry fields as `list_windows`.
+/// Captures one window without opening the EIS input session.
 ///
-/// Needs the EIS region for the scale factor, so the first call may open a
-/// session (and with it a portal authorization dialog).
-fn tool_screenshot_window(args: &Value) -> Result<String> {
+/// Direct window capture is preferred. The output-crop fallback needs a real
+/// scale factor, so it is available only when an input session is already open;
+/// otherwise the response asks the caller to run `prepare_input` explicitly.
+fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
     let needle = args
         .get("window")
         .and_then(Value::as_str)
         .context("screenshot_window needs \"window\" (identifier, app_id or title)")?;
-    // Resolve the window before opening a session, so a typo does not raise a
-    // portal dialog.
-    let windows = toplevel::list()?;
-    let target = toplevel::find(&windows, needle)?;
-    let scene = Scene::from_windows(windows, true)?;
-    let index = scene.find_index(&target.identifier)?;
-    let base = scene.geometry(index)?.clone();
+    let scene = Scene::load(false)?;
+    let index = scene.find_index(needle)?;
     let window = &scene.windows[index];
-    let out = scene.output(base.output_index)?;
+    let logical = window.logical.context(
+        "the compositor has not reported this window's geometry yet; re-run list_windows",
+    )?;
+    let output_index = window
+        .output
+        .as_deref()
+        .and_then(|name| output_index_for(name, &scene.outputs))
+        .context("the window's output is not present in the current topology")?;
+    let out = scene.output(output_index)?;
+    let existing_geometry = scene.geoms[index].clone();
 
+    let (mut direct, direct_error) = match capture::capture_window(&window.identifier) {
+        Ok(frame) => (frame, None),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    let direct_size = direct.as_ref().map(|frame| (frame.width, frame.height));
+    let direct_covers_window = direct.as_ref().is_some_and(|frame| {
+        coords::direct_frame_covers_logical(logical, frame.width, frame.height)
+    });
+
+    if direct_covers_window {
+        let frame = direct.take().expect("direct capture was checked above");
+        let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+            .context("direct window frame did not match its declared size")?;
+        let path = save_window_png(&image)?;
+        let (pixels, scale) = existing_geometry
+            .as_ref()
+            .map_or((Value::Null, Value::Null), |g| {
+                (json!(g.pixels), json!(g.region.scale))
+            });
+        let coordinates = json!({
+            "window": window.identifier,
+            "capture": "window",
+            "image": {"width": frame.width, "height": frame.height},
+            "logical": logical,
+            "origin": Value::Null,
+        });
+        let (locked, lock_evidence, mut notes) = lock_notes();
+        notes.push(
+            "captured directly from the window source; occluding windows are not included"
+                .to_string(),
+        );
+        if existing_geometry.is_none() {
+            notes.push(
+                "the input session was not opened. scale and pixels are null, but the coordinates \
+                 object is complete; click_window resolves input coordinates when it acts"
+                    .to_string(),
+            );
+        }
+        notes.push(
+            "pass the coordinates object unchanged to click_window / move_window / scroll_window \
+             with a point from this image"
+                .to_string(),
+        );
+        return Ok(ToolResponse::success(serde_json::to_string_pretty(
+            &json!({
+                "path": path.display().to_string(),
+                "capture": {
+                    "source": "window",
+                    "direct": true,
+                    "native_size": {"width": frame.width, "height": frame.height},
+                    "coordinate_safe": true,
+                },
+                "input_session_opened": false,
+                "side_effects": [],
+                "image": {"width": frame.width, "height": frame.height},
+                "coordinates": coordinates,
+                "window": window_ref(window),
+                "output": {
+                    "index": output_index,
+                    "name": window.output,
+                    "size": {"width": out.width, "height": out.height},
+                    "scale": scale,
+                },
+                "scale": scale,
+                "logical": logical,
+                "pixels": pixels,
+                "origin": Value::Null,
+                "workspaces": window.workspaces,
+                "on_active_workspace": window.on_active_workspace,
+                "screen_locked": locked,
+                "lock_evidence": lock_evidence,
+                "notes": notes,
+                "summary": format!(
+                    "{}\n{}x{} via window, window {:?}\npass the coordinates object unchanged to \
+                     click_window / move_window / scroll_window",
+                    path.display(),
+                    frame.width,
+                    frame.height,
+                    window.title
+                ),
+            }),
+        )?));
+    }
+
+    if existing_geometry.is_none() {
+        let mut structured = json!({
+            "status": "needs_input_session",
+            "message": "direct window capture did not produce a coordinate-safe full-window image, \
+                        and the output-crop fallback needs the EIS scale. This observation tool did \
+                        not open the portal.",
+            "window": window_ref(window),
+            "output": {
+                "index": output_index,
+                "name": window.output,
+                "size": {"width": out.width, "height": out.height},
+            },
+            "logical": logical,
+            "capture": {
+                "source": direct_size.map(|_| "window"),
+                "native_size": direct_size.map(|(width, height)| {
+                    json!({"width": width, "height": height})
+                }).unwrap_or(Value::Null),
+                "coordinate_safe": false,
+            },
+            "direct_error": direct_error,
+            "next_action": "call prepare_input (a possible one-time system authorization dialog), \
+                            then take a new screenshot_window",
+        });
+        if let Some(frame) = direct.take() {
+            let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+                .context("direct window frame did not match its declared size")?;
+            let path = save_window_png(&image)?;
+            if let Some(object) = structured.as_object_mut() {
+                object.insert("path".to_string(), json!(path.display().to_string()));
+                object.insert(
+                    "image".to_string(),
+                    json!({"width": frame.width, "height": frame.height}),
+                );
+            }
+        }
+        return Ok(ToolResponse::error(structured));
+    }
+
+    let base = existing_geometry.context("existing input geometry disappeared")?;
     let shot = capture::capture(base.output_index)?;
-    // Clamp against the frame's own size: it should equal the wl_output mode,
-    // but the frame is what the pixels actually come from.
     let geometry = WindowGeometry::new(
         base.region,
         base.output_index,
@@ -1083,10 +1385,9 @@ fn tool_screenshot_window(args: &Value) -> Result<String> {
     .with_context(|| {
         format!(
             "{:?} lies entirely outside output #{} ({}x{})",
-            target.title, out.index, shot.width, shot.height
+            window.title, out.index, shot.width, shot.height
         )
     })?;
-
     let image = image::RgbaImage::from_raw(shot.width, shot.height, shot.rgba)
         .context("captured frame did not match its declared size")?;
     let cropped = image::imageops::crop_imm(
@@ -1097,66 +1398,72 @@ fn tool_screenshot_window(args: &Value) -> Result<String> {
         geometry.image.height as u32,
     )
     .to_image();
-
-    let dir = runtime_dir().join("cosmic-desktop-mcp");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = dir.join(format!("window-{stamp}.png"));
-    cropped
-        .save_with_format(&path, image::ImageFormat::Png)
-        .with_context(|| format!("write {}", path.display()))?;
-
+    let path = save_window_png(&cropped)?;
+    let coordinates = json!({
+        "window": window.identifier,
+        "capture": "output_crop",
+        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "logical": geometry.logical,
+        "origin": {"x": geometry.image.x, "y": geometry.image.y},
+    });
     let (locked, lock_evidence, mut notes) = lock_notes();
     notes.extend(pointer_notes(window, &geometry));
     notes.push(
-        "the returned image is window image pixel space: pass (x, y) from it to click_window / \
-         move_window / scroll_window for this window. Do not add the origin and call click."
+        "the output-crop fallback used an input session that was already open; screenshot_window \
+         did not open it"
             .to_string(),
     );
-    let name = geometry
-        .output_name
-        .clone()
-        .unwrap_or_else(|| "?".to_string());
-    let width = geometry.image.width;
-    let height = geometry.image.height;
-
-    Ok(serde_json::to_string_pretty(&json!({
-        "path": path.display().to_string(),
-        "image": {"width": width, "height": height},
-        "window": window_ref(window),
-        "output": {
-            "index": geometry.output_index,
-            "name": geometry.output_name,
-            "size": {"width": shot.width, "height": shot.height},
+    if let Some(err) = direct_error {
+        notes.push(format!(
+            "direct window capture was unavailable or unusable: {err}"
+        ));
+    }
+    notes.push(
+        "pass the coordinates object unchanged to click_window / move_window / scroll_window with \
+         a point from this image"
+            .to_string(),
+    );
+    Ok(ToolResponse::success(serde_json::to_string_pretty(
+        &json!({
+            "path": path.display().to_string(),
+            "capture": {
+                "source": "output_crop",
+                "direct": false,
+                "native_size": direct_size.map(|(width, height)| {
+                    json!({"width": width, "height": height})
+                }).unwrap_or(Value::Null),
+                "coordinate_safe": true,
+            },
+            "input_session_opened": false,
+            "side_effects": [],
+            "image": {"width": geometry.image.width, "height": geometry.image.height},
+            "coordinates": coordinates,
+            "window": window_ref(window),
+            "output": {
+                "index": geometry.output_index,
+                "name": geometry.output_name,
+                "size": {"width": out.width, "height": out.height},
+                "scale": geometry.region.scale,
+            },
             "scale": geometry.region.scale,
-        },
-        "scale": geometry.region.scale,
-        "logical": geometry.logical,
-        "pixels": geometry.pixels,
-        "origin": {"x": geometry.image.x, "y": geometry.image.y},
-        "workspaces": window.workspaces,
-        "on_active_workspace": window.on_active_workspace,
-        "screen_locked": locked,
-        "lock_evidence": lock_evidence,
-        "notes": notes,
-        "summary": format!(
-            "{}\n{}x{} from output_index={} ({}), window {:?}\nwindow origin in that output's \
-             screenshot pixels: x={} y={}\nfor a point (dx,dy) inside this image use \
-             click_window(window={:?}, x=dx, y=dy) — no output index and no arithmetic",
-            path.display(),
-            width,
-            height,
-            geometry.output_index,
-            name,
-            window.title,
-            geometry.image.x,
-            geometry.image.y,
-            window.title
-        ),
-    }))?)
+            "logical": geometry.logical,
+            "pixels": geometry.pixels,
+            "origin": {"x": geometry.image.x, "y": geometry.image.y},
+            "workspaces": window.workspaces,
+            "on_active_workspace": window.on_active_workspace,
+            "screen_locked": locked,
+            "lock_evidence": lock_evidence,
+            "notes": notes,
+            "summary": format!(
+                "{}\n{}x{} via output_crop, window {:?}\npass the coordinates object unchanged to \
+                 click_window / move_window / scroll_window",
+                path.display(),
+                geometry.image.width,
+                geometry.image.height,
+                window.title
+            ),
+        }),
+    )?))
 }
 
 fn tool_window_action(args: &Value) -> Result<String> {
@@ -1195,17 +1502,179 @@ fn window_arg<'a>(args: &'a Value, tool: &str) -> Result<&'a str> {
         .with_context(|| format!("{tool} needs \"window\" (identifier, app_id or title)"))
 }
 
-/// Resolves a window-image point into every space, using the scene's geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowCaptureSpace {
+    Window,
+    OutputCrop,
+}
+
+#[derive(Clone, Debug)]
+struct WindowCoordinates {
+    window: String,
+    capture: WindowCaptureSpace,
+    image: (u32, u32),
+    logical: Rect,
+    origin: Option<(i32, i32)>,
+}
+
+fn window_coordinates_arg(args: &Value) -> Result<WindowCoordinates> {
+    let coordinates = args
+        .get("coordinates")
+        .and_then(Value::as_object)
+        .context("window input needs the \"coordinates\" object returned by screenshot_window")?;
+    let window = coordinates
+        .get("window")
+        .and_then(Value::as_str)
+        .context("coordinates.window is missing")?
+        .to_string();
+    let capture = match coordinates.get("capture").and_then(Value::as_str) {
+        Some("window") => WindowCaptureSpace::Window,
+        Some("output_crop") => WindowCaptureSpace::OutputCrop,
+        Some(other) => {
+            bail!("coordinates.capture is {other:?}; expected \"window\" or \"output_crop\"")
+        }
+        None => bail!("coordinates.capture is missing"),
+    };
+    let image = coordinates
+        .get("image")
+        .and_then(Value::as_object)
+        .context("coordinates.image is missing")?;
+    let width = image
+        .get("width")
+        .and_then(Value::as_u64)
+        .context("coordinates.image.width is missing")?;
+    let height = image
+        .get("height")
+        .and_then(Value::as_u64)
+        .context("coordinates.image.height is missing")?;
+    let width = u32::try_from(width).context("coordinates.image.width is out of range")?;
+    let height = u32::try_from(height).context("coordinates.image.height is out of range")?;
+    if width == 0 || height == 0 {
+        bail!("coordinates.image must have non-zero width and height");
+    }
+    let logical = rect_from_json(
+        coordinates
+            .get("logical")
+            .context("coordinates.logical is missing")?,
+    )?;
+    if logical.width <= 0 || logical.height <= 0 {
+        bail!("coordinates.logical must have positive width and height");
+    }
+    let origin = coordinates
+        .get("origin")
+        .filter(|value| !value.is_null())
+        .map(|value| -> Result<(i32, i32)> {
+            let origin = value
+                .as_object()
+                .context("coordinates.origin must be an object or null")?;
+            let coordinate = |name: &str| -> Result<i32> {
+                let value = origin
+                    .get(name)
+                    .and_then(Value::as_i64)
+                    .with_context(|| format!("coordinates.origin.{name} is missing"))?;
+                i32::try_from(value)
+                    .with_context(|| format!("coordinates.origin.{name} is out of range"))
+            };
+            Ok((coordinate("x")?, coordinate("y")?))
+        })
+        .transpose()?;
+    if capture == WindowCaptureSpace::OutputCrop && origin.is_none() {
+        bail!("coordinates.origin is required for capture=\"output_crop\"");
+    }
+    Ok(WindowCoordinates {
+        window,
+        capture,
+        image: (width, height),
+        logical,
+        origin,
+    })
+}
+
+fn rect_from_json(value: &Value) -> Result<Rect> {
+    let rect = value.as_object().context("rect must be an object")?;
+    let number = |name: &str| -> Result<i32> {
+        let value = rect
+            .get(name)
+            .and_then(Value::as_i64)
+            .with_context(|| format!("rect.{name} is missing"))?;
+        i32::try_from(value).with_context(|| format!("rect.{name} is out of range"))
+    };
+    Ok(Rect {
+        x: number("x")?,
+        y: number("y")?,
+        width: number("width")?,
+        height: number("height")?,
+    })
+}
+
+/// Resolves a point from a specific `screenshot_window` result into every
+/// space, opening no EIS session itself; the caller has already loaded the
+/// scene for an input action.
 fn window_point(
     scene: &Scene,
-    needle: &str,
+    coordinates: &WindowCoordinates,
     x: i32,
     y: i32,
 ) -> Result<(usize, WindowGeometry, i32, i32, f64, f64)> {
-    let index = scene.find_index(needle)?;
+    let index = scene.find_index(&coordinates.window)?;
+    let window = &scene.windows[index];
+    if window.logical != Some(coordinates.logical) {
+        bail!(
+            "the screenshot is stale: its logical window rect was {:?}, but the window is now at \
+             {:?}; take a new screenshot_window",
+            coordinates.logical,
+            window.logical
+        );
+    }
     let geometry = scene.geometry(index)?.clone();
-    let (ox, oy) = geometry.window_to_output(x, y)?;
-    let (lx, ly) = geometry.window_to_logical(x, y)?;
+    let (ox, oy, lx, ly) = match coordinates.capture {
+        WindowCaptureSpace::Window => {
+            if !coords::direct_frame_covers_logical(
+                coordinates.logical,
+                coordinates.image.0,
+                coordinates.image.1,
+            ) {
+                bail!(
+                    "coordinates describe a direct window image that does not cover the whole \
+                     window; take a new screenshot_window"
+                );
+            }
+            let (ox, oy) =
+                coords::direct_image_to_output(geometry.pixels, coordinates.image, x, y)?;
+            let (lx, ly) =
+                coords::direct_image_to_logical(coordinates.logical, coordinates.image, x, y)?;
+            point_in_output(scene.output(geometry.output_index)?, ox, oy)?;
+            (ox, oy, lx, ly)
+        }
+        WindowCaptureSpace::OutputCrop => {
+            let origin = coordinates
+                .origin
+                .context("output_crop origin is missing")?;
+            if coordinates.image
+                != (
+                    geometry.image.width.max(0) as u32,
+                    geometry.image.height.max(0) as u32,
+                )
+                || origin != (geometry.image.x, geometry.image.y)
+            {
+                bail!(
+                    "the screenshot is stale: its output crop was {}x{} at ({}, {}), but the \
+                     current crop is {}x{} at ({}, {}); take a new screenshot_window",
+                    coordinates.image.0,
+                    coordinates.image.1,
+                    origin.0,
+                    origin.1,
+                    geometry.image.width,
+                    geometry.image.height,
+                    geometry.image.x,
+                    geometry.image.y
+                );
+            }
+            let (ox, oy) = geometry.window_to_output(x, y)?;
+            let (lx, ly) = geometry.window_to_logical(x, y)?;
+            (ox, oy, lx, ly)
+        }
+    };
     Ok((index, geometry, ox, oy, lx, ly))
 }
 
@@ -1334,11 +1803,19 @@ fn tool_click_window(args: &Value) -> Result<String> {
     let y = int_arg(args, "y")?;
     let button = button_arg(args)?;
     let count = count_arg(args);
+    let coordinates = window_coordinates_arg(args)?;
 
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
+    if target.identifier != coordinates.window {
+        bail!(
+            "the coordinates object belongs to window {:?}, not the requested window {:?}",
+            coordinates.window,
+            target.identifier
+        );
+    }
     let scene = Scene::from_windows(windows, true)?;
-    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &target.identifier, x, y)?;
+    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &coordinates, x, y)?;
     let window = &scene.windows[index];
     let out = scene.output(geometry.output_index)?;
     let hit = scene.hit(geometry.output_index, ox, oy);
@@ -1358,7 +1835,16 @@ fn tool_click_window(args: &Value) -> Result<String> {
         "window": window_ref(window),
         "output": output_json(out),
         "scale": geometry.region.scale,
-        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "image": {"width": coordinates.image.0, "height": coordinates.image.1},
+        "coordinates": {
+            "capture": match coordinates.capture {
+                WindowCaptureSpace::Window => "window",
+                WindowCaptureSpace::OutputCrop => "output_crop",
+            },
+            "image": {"width": coordinates.image.0, "height": coordinates.image.1},
+            "logical": coordinates.logical,
+            "origin": coordinates.origin.map(|(x, y)| json!({"x": x, "y": y})).unwrap_or(Value::Null),
+        },
         "point": {
             "image": {"x": x, "y": y},
             "output": {"x": ox, "y": oy},
@@ -1377,11 +1863,19 @@ fn tool_move_window(args: &Value) -> Result<String> {
     let needle = window_arg(args, "move_window")?;
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
+    let coordinates = window_coordinates_arg(args)?;
 
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
+    if target.identifier != coordinates.window {
+        bail!(
+            "the coordinates object belongs to window {:?}, not the requested window {:?}",
+            coordinates.window,
+            target.identifier
+        );
+    }
     let scene = Scene::from_windows(windows, true)?;
-    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &target.identifier, x, y)?;
+    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &coordinates, x, y)?;
     let window = &scene.windows[index];
     let out = scene.output(geometry.output_index)?;
     let hit = scene.hit(geometry.output_index, ox, oy);
@@ -1399,7 +1893,16 @@ fn tool_move_window(args: &Value) -> Result<String> {
         "window": window_ref(window),
         "output": output_json(out),
         "scale": geometry.region.scale,
-        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "image": {"width": coordinates.image.0, "height": coordinates.image.1},
+        "coordinates": {
+            "capture": match coordinates.capture {
+                WindowCaptureSpace::Window => "window",
+                WindowCaptureSpace::OutputCrop => "output_crop",
+            },
+            "image": {"width": coordinates.image.0, "height": coordinates.image.1},
+            "logical": coordinates.logical,
+            "origin": coordinates.origin.map(|(x, y)| json!({"x": x, "y": y})).unwrap_or(Value::Null),
+        },
         "point": {
             "image": {"x": x, "y": y},
             "output": {"x": ox, "y": oy},
@@ -1420,11 +1923,19 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
     let y = int_arg(args, "y")?;
     let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
     let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let coordinates = window_coordinates_arg(args)?;
 
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
+    if target.identifier != coordinates.window {
+        bail!(
+            "the coordinates object belongs to window {:?}, not the requested window {:?}",
+            coordinates.window,
+            target.identifier
+        );
+    }
     let scene = Scene::from_windows(windows, true)?;
-    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &target.identifier, x, y)?;
+    let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &coordinates, x, y)?;
     let window = &scene.windows[index];
     let out = scene.output(geometry.output_index)?;
     let hit = scene.hit(geometry.output_index, ox, oy);
@@ -1444,7 +1955,16 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
         "window": window_ref(window),
         "output": output_json(out),
         "scale": geometry.region.scale,
-        "image": {"width": geometry.image.width, "height": geometry.image.height},
+        "image": {"width": coordinates.image.0, "height": coordinates.image.1},
+        "coordinates": {
+            "capture": match coordinates.capture {
+                WindowCaptureSpace::Window => "window",
+                WindowCaptureSpace::OutputCrop => "output_crop",
+            },
+            "image": {"width": coordinates.image.0, "height": coordinates.image.1},
+            "logical": coordinates.logical,
+            "origin": coordinates.origin.map(|(x, y)| json!({"x": x, "y": y})).unwrap_or(Value::Null),
+        },
         "point": {
             "image": {"x": x, "y": y},
             "output": {"x": ox, "y": oy},
@@ -1549,6 +2069,20 @@ fn runtime_dir() -> PathBuf {
     crate::session::runtime_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
+fn save_window_png(image: &image::RgbaImage) -> Result<PathBuf> {
+    let dir = runtime_dir().join("cosmic-desktop-mcp");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("window-{stamp}.png"));
+    image
+        .save_with_format(&path, image::ImageFormat::Png)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
 /// `--doctor` output: proves the three moving parts work without running a
 /// tool call against a live desktop.
 pub fn doctor() -> Result<()> {
@@ -1613,6 +2147,7 @@ mod tests {
             [
                 "screenshot",
                 "env_info",
+                "prepare_input",
                 "list_windows",
                 "screenshot_window",
                 "window_action",
@@ -1646,11 +2181,17 @@ mod tests {
 
     #[test]
     fn rmcp_tool_results_keep_tool_errors_visible_to_the_client() {
-        let success = tool_call_result(Ok("ok".to_string()));
+        let success = tool_call_result(Ok(ToolResponse::success(
+            json!({"ok": true, "count": 2}).to_string(),
+        )));
         assert_eq!(success.is_error, Some(false));
         assert_eq!(
             success.content[0].as_text().map(|text| text.text.as_str()),
-            Some("ok")
+            Some(r#"{"count":2,"ok":true}"#)
+        );
+        assert_eq!(
+            success.structured_content,
+            Some(json!({"ok": true, "count": 2}))
         );
 
         let failure = tool_call_result(Err(anyhow::anyhow!("tool failed: detail")));
@@ -1659,5 +2200,242 @@ mod tests {
             failure.content[0].as_text().map(|text| text.text.as_str()),
             Some("tool failed: detail")
         );
+        assert!(failure.structured_content.is_none());
+    }
+
+    #[test]
+    fn authorization_errors_are_structured_for_the_client() {
+        let timeout = tool_call_result(Err(anyhow::anyhow!(
+            "open an EIS session: the EIS session did not come up within 60s"
+        )));
+        assert_eq!(timeout.is_error, Some(true));
+        assert_eq!(
+            timeout
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("authorization_timeout")
+        );
+
+        let denied = tool_call_result(Err(anyhow::anyhow!(
+            "the portal granted no input devices — authorization was probably denied"
+        )));
+        assert_eq!(
+            denied
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("authorization_denied")
+        );
+
+        let unavailable = tool_call_result(Err(anyhow::anyhow!(
+            "connect to the RemoteDesktop portal: service unavailable"
+        )));
+        assert_eq!(
+            unavailable
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("authorization_unavailable")
+        );
+    }
+
+    #[test]
+    fn structured_tool_errors_survive_without_text_classification() {
+        let result = tool_call_result(Ok(ToolResponse::error(json!({
+            "status": "needs_input_session",
+            "next_action": "call prepare_input"
+        }))));
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str),
+            Some("needs_input_session")
+        );
+    }
+
+    #[test]
+    fn window_coordinates_parse_direct_and_output_crop_shapes() {
+        let direct = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "window",
+                "image": {"width": 1280, "height": 720},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": null
+            }
+        }))
+        .unwrap();
+        assert_eq!(direct.window, "abc");
+        assert_eq!(direct.capture, WindowCaptureSpace::Window);
+        assert_eq!(direct.image, (1280, 720));
+        assert_eq!(direct.origin, None);
+
+        let crop = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "output_crop",
+                "image": {"width": 960, "height": 540},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": {"x": 15, "y": 30}
+            }
+        }))
+        .unwrap();
+        assert_eq!(crop.capture, WindowCaptureSpace::OutputCrop);
+        assert_eq!(crop.origin, Some((15, 30)));
+    }
+
+    #[test]
+    fn window_coordinates_reject_incomplete_or_ambiguous_shapes() {
+        let missing_origin = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "output_crop",
+                "image": {"width": 960, "height": 540},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360}
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_origin.contains("origin is required"),
+            "{missing_origin}"
+        );
+
+        let incomplete_origin = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "output_crop",
+                "image": {"width": 960, "height": 540},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": {"x": 15}
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            incomplete_origin.contains("origin.y is missing"),
+            "{incomplete_origin}"
+        );
+
+        let bad_capture = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "surface",
+                "image": {"width": 960, "height": 540},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360}
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(bad_capture.contains("expected \"window\""), "{bad_capture}");
+    }
+
+    fn coordinate_scene() -> Scene {
+        let logical = Rect {
+            x: 10,
+            y: 20,
+            width: 640,
+            height: 360,
+        };
+        let region = crate::eis::Region {
+            x: 0.0,
+            y: 0.0,
+            width: 1280,
+            height: 720,
+            scale: 1.5,
+            mapping_id: Some("eDP-1".into()),
+        };
+        let output = capture::OutputInfo {
+            index: 0,
+            name: Some("eDP-1".into()),
+            width: 1920,
+            height: 1080,
+            scale: 2,
+        };
+        let window = Window {
+            identifier: "window-id".into(),
+            title: "test window".into(),
+            app_id: "test.app".into(),
+            output: Some("eDP-1".into()),
+            logical: Some(logical),
+            ..Window::default()
+        };
+        let geometry = WindowGeometry::new(
+            region.clone(),
+            0,
+            Some("eDP-1".into()),
+            logical,
+            (output.width, output.height),
+        )
+        .unwrap();
+        Scene {
+            windows: vec![window],
+            outputs: vec![output],
+            regions: vec![region],
+            geoms: vec![Some(geometry)],
+        }
+    }
+
+    #[test]
+    fn direct_window_points_use_the_screenshot_dimensions() {
+        let scene = coordinate_scene();
+        let coordinates = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "window-id",
+                "capture": "window",
+                "image": {"width": 1280, "height": 720},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": null
+            }
+        }))
+        .unwrap();
+        let (_, _, ox, oy, lx, ly) = window_point(&scene, &coordinates, 640, 360).unwrap();
+        assert_eq!((ox, oy), (495, 300));
+        assert_eq!((lx, ly), (330.0, 200.0));
+    }
+
+    #[test]
+    fn direct_window_points_reject_incomplete_captures() {
+        let scene = coordinate_scene();
+        let coordinates = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "window-id",
+                "capture": "window",
+                "image": {"width": 1280, "height": 696},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": null
+            }
+        }))
+        .unwrap();
+        let err = window_point(&scene, &coordinates, 640, 348)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not cover the whole window"), "{err}");
+    }
+
+    #[test]
+    fn output_crop_points_reject_a_stale_origin() {
+        let scene = coordinate_scene();
+        let coordinates = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "window-id",
+                "capture": "output_crop",
+                "image": {"width": 960, "height": 540},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": {"x": 99, "y": 30}
+            }
+        }))
+        .unwrap();
+        let err = window_point(&scene, &coordinates, 10, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("screenshot is stale"), "{err}");
     }
 }

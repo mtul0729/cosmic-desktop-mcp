@@ -1,10 +1,17 @@
-//! Screen capture over `ext_image_copy_capture_v1` + `wl_shm`.
+//! Screen and toplevel capture over `ext_image_copy_capture_v1` + `wl_shm`.
 //!
 //! COSMIC does not implement `wlr-screencopy`, and its portal-based
 //! `cosmic-screenshot` blocks forever when asked for a non-interactive
 //! capture. The staging capture protocol is advertised (global name 17 on this
 //! machine) and needs no dialog, so it is the only usable path.
+//!
+//! Output capture uses `ext_output_image_capture_source_manager_v1`. Window
+//! capture uses `ext_foreign_toplevel_image_capture_source_manager_v1` when
+//! available, avoiding a full-output copy; callers fall back to an output crop
+//! because COSMIC returns direct window sources at logical size and may omit
+//! server-side decorations.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::ptr;
@@ -13,10 +20,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
-    globals::{GlobalListContents, registry_queue_init},
+    backend::ObjectId,
+    event_created_child,
+    globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool},
 };
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+};
 use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
@@ -32,6 +46,13 @@ pub struct Shot {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub output: OutputInfo,
+}
+
+/// A captured image without the output metadata used by whole-output shots.
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +73,9 @@ struct State {
     pending_mode: Option<(i32, i32)>,
     pending_scale: Option<i32>,
     pending_name: Option<String>,
+
+    foreign_handles: HashMap<ObjectId, ExtForeignToplevelHandleV1>,
+    foreign_identifiers: HashMap<ObjectId, String>,
 
     size: Option<(u32, u32)>,
     formats: Vec<wl_shm::Format>,
@@ -188,6 +212,59 @@ impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for State {
     }
 }
 
+impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtForeignToplevelImageCaptureSourceManagerV1,
+        _event: <ExtForeignToplevelImageCaptureSourceManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtForeignToplevelListV1,
+        event: ext_foreign_toplevel_list_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } = event {
+            state.foreign_handles.insert(toplevel.id(), toplevel);
+        }
+    }
+
+    event_created_child!(State, ExtForeignToplevelListV1, [
+        ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE => (ExtForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelHandleV1,
+        event: ext_foreign_toplevel_handle_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => {
+                state.foreign_identifiers.insert(proxy.id(), identifier);
+            }
+            ext_foreign_toplevel_handle_v1::Event::Closed => {
+                state.foreign_handles.remove(&proxy.id());
+                state.foreign_identifiers.remove(&proxy.id());
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State {
     fn event(
         state: &mut Self,
@@ -314,21 +391,77 @@ pub fn capture(output_index: usize) -> Result<Shot> {
         .context("output proxy index out of range")?
         .clone();
 
-    let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).context("bind wl_shm")?;
     let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
         .bind(&qh, 1..=1, ())
         .context("bind ext_output_image_capture_source_manager_v1")?;
+    let source = source_mgr.create_source(&output, &qh, ());
+    let frame = capture_source(&conn, &globals, &mut queue, &mut state, source)?;
+
+    Ok(Shot {
+        width: frame.width,
+        height: frame.height,
+        rgba: frame.rgba,
+        output: target,
+    })
+}
+
+/// Captures a foreign toplevel directly, without first copying its output.
+///
+/// `None` means the compositor does not advertise the window capture source
+/// protocol, so the caller should use [`capture`] plus a crop. The source
+/// image may contain the whole toplevel even when part of it is off-screen;
+/// callers must fit it back into the visible crop before using its pixels as
+/// window-image coordinates.
+pub fn capture_window(identifier: &str) -> Result<Option<Frame>> {
+    let conn = super::connect()?;
+    let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
+    let qh = queue.handle();
+
+    let Ok(source_mgr) =
+        globals.bind::<ExtForeignToplevelImageCaptureSourceManagerV1, _, _>(&qh, 1..=1, ())
+    else {
+        return Ok(None);
+    };
+    let Ok(_list) = globals.bind::<ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ()) else {
+        return Ok(None);
+    };
+
+    let mut state = State::default();
+    for _ in 0..3 {
+        queue
+            .roundtrip(&mut state)
+            .context("roundtrip for window capture handles")?;
+    }
+
+    let target = state
+        .foreign_identifiers
+        .iter()
+        .find_map(|(id, found)| (found == identifier).then_some(id))
+        .and_then(|id| state.foreign_handles.get(id))
+        .with_context(|| format!("window {identifier:?} was not available for direct capture"))?
+        .clone();
+
+    let source = source_mgr.create_source(&target, &qh, ());
+    capture_source(&conn, &globals, &mut queue, &mut state, source).map(Some)
+}
+
+fn capture_source(
+    conn: &Connection,
+    globals: &GlobalList,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    source: ExtImageCaptureSourceV1,
+) -> Result<Frame> {
+    let qh = queue.handle();
+    let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).context("bind wl_shm")?;
     let capture_mgr: ExtImageCopyCaptureManagerV1 = globals
         .bind(&qh, 1..=1, ())
         .context("bind ext_image_copy_capture_manager_v1")?;
 
-    let source = source_mgr.create_source(&output, &qh, ());
     let session = capture_mgr.create_session(&source, Options::empty(), &qh, ());
 
-    wait(&conn, &mut queue, &mut state, |s| {
-        s.session_done && s.size.is_some()
-    })
-    .context("waiting for capture session parameters")?;
+    wait(conn, queue, state, |s| s.session_done && s.size.is_some())
+        .context("waiting for capture session parameters")?;
 
     if let Some(code) = state.frame_failed.take() {
         bail!("capture session was stopped (reason {code})");
@@ -359,7 +492,7 @@ pub fn capture(output_index: usize) -> Result<Shot> {
     frame.capture();
     conn.flush().context("flush capture request")?;
 
-    wait(&conn, &mut queue, &mut state, |s| {
+    wait(conn, queue, state, |s| {
         s.frame_ready || s.frame_failed.is_some()
     })
     .context("waiting for captured frame")?;
@@ -376,11 +509,10 @@ pub fn capture(output_index: usize) -> Result<Shot> {
     session.destroy();
     source.destroy();
 
-    Ok(Shot {
+    Ok(Frame {
         width,
         height,
         rgba,
-        output: target,
     })
 }
 

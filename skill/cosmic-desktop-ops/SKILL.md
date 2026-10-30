@@ -19,7 +19,8 @@ README. This file only covers *how to use the tools and what will bite you*.
 ## Step 0: check the tools are actually there
 
 ```
-tools/list → screenshot / list_windows / click / applets / ...
+tools/list → screenshot / list_windows / screenshot_window / prepare_input /
+            click_window / applets / ...
 ```
 
 If they are missing, say the machine has no cosmic-desktop-mcp wired up and give
@@ -38,12 +39,35 @@ This is an MCP launch-environment failure, not a compositor or tool bug.
 ## Step 1: `env_info` for the topology
 
 Once at the start of a session, and again after plugging in a monitor or
-changing a scale. It returns how many outputs exist, each one's name,
-resolution and scale, and whether the EIS session is already authorized. The
+changing a scale. It returns how many outputs exist, each one's name and
+physical resolution, and whether the EIS session is already authorized. EIS
+region and scale fields are null until a session exists; that is expected. The
 `output` indices used everywhere else follow this order.
 
 `env_info` opens no EIS session and shows no permission dialog, so it is free to
 call.
+
+## Side effects and authorization
+
+The tools have three deliberate layers:
+
+- **Observation:** `env_info`, `list_windows`, `screenshot`,
+  `screenshot_window`. These never open EIS and never raise the RemoteDesktop
+  portal dialog.
+- **Preparation:** `prepare_input`. This may open EIS and show the one-time
+  system authorization dialog. It is the only status-like tool with that side
+  effect.
+- **Actions:** `click`, `move`, `scroll`, their `_window` variants,
+  `type_text`, `key`. These open EIS lazily on first use.
+
+If a tool needs authorization, ask the human to approve the system dialog. When
+the client supplies `_meta.progressToken`, the server emits a progress
+notification every two seconds while it waits. If the dialog is ignored for 60
+seconds, the error is structured as
+`structuredContent.status="authorization_timeout"`. Cancellation/denial maps to
+`authorization_denied`; a missing or broken portal maps to
+`authorization_unavailable`. Read the text too if the client does not expose
+structured content.
 
 ## Coordinates: three spaces, and one rule
 
@@ -51,9 +75,12 @@ call.
   `move` / `scroll` take these **and the matching `output` index**. The output
   defaults to 0 and is never inferred from x/y, so a point from another monitor's
   screenshot silently clicks the wrong screen.
-- **window image pixels** — what `screenshot_window {window}` returns. Pass a
-  point straight to `click_window` / `move_window` / `scroll_window`; they
-  resolve the window's output and crop origin themselves.
+- **window image pixels** — what `screenshot_window {window}` returns. The image
+  is either a native-size direct window capture or an output crop; it is not
+  resized. Pass the response's complete `coordinates` object unchanged to
+  `click_window` / `move_window` / `scroll_window` together with the point.
+  Those tools validate the window and screenshot freshness and resolve the
+  output and logical point themselves.
 - **logical** — the compositor's desktop coordinates. No tool takes them.
 
 Never add a window origin to a point and call `click`. The window tools exist so
@@ -63,20 +90,34 @@ is empty here but inside a window there.
 
 Do not derive scale from `wl_output.scale`. COSMIC always reports 2 there
 (integer protocol); the real ratio (1.25 / 1.5) only exists inside the EIS
-region the tool reads, and `screenshot_window` reports it as `scale`.
+region. `screenshot_window` may report `scale:null` when no EIS session exists,
+because observation must not open one. That is fine: its `coordinates` object
+contains everything the window input tools need.
+
+`capture.coordinate_safe=true` means the image covers the whole logical window.
+If COSMIC omits a server-side titlebar from direct capture, the tool rejects the
+image and returns `status:"needs_input_session"` when EIS is closed. Run
+`prepare_input`, ask the human to approve, then take a fresh
+`screenshot_window`; it will use an output crop.
 
 **Clicking inside a window:**
 
 ```
 screenshot_window {window: "kitty"}
-→ { "image": {"width": 942, "height": 1008},
-    "logical": {"x": 644, "y": 40, "width": 628, "height": 672},
-    "pixels":  {"x": 966, "y": 60, "width": 942, "height": 1008},
-    "origin":  {"x": 966, "y": 60},
+→ { "capture": {"source": "output_crop", "coordinate_safe": true},
+    "image": {"width": 942, "height": 1008},
+    "coordinates": {
+      "window": "<identifier>",
+      "capture": "output_crop",
+      "image": {"width": 942, "height": 1008},
+      "logical": {"x": 644, "y": 40, "width": 628, "height": 672},
+      "origin": {"x": 966, "y": 60}
+    },
     "output":  {"index": 1, "name": "eDP-1", "scale": 1.5},
     "on_active_workspace": true, ... }
 
-click_window {window: "kitty", x: 468, y: 84}
+click_window {window: "kitty", x: 468, y: 84,
+              coordinates: <the object above, unchanged>}
 ```
 
 Read the point off the image and pass it unchanged. `click_window` converts it
@@ -84,7 +125,10 @@ to output pixels and logical coordinates and says which ones it used.
 
 ## The loop
 
-1. `screenshot {output}` → open the PNG with the Read tool and actually look at it;
+1. `screenshot_window` for a known window, or `screenshot {output}` for the
+   desktop → open the PNG with the Read tool and actually look at it. If the
+   reply is `needs_input_session`, run `prepare_input`, wait for the human, then
+   repeat the screenshot;
 2. pick a pixel coordinate (what you see on the image *is* the coordinate);
 3. `click_window` inside a window (or `click` for the desktop), then `type_text` /
    `key` / `scroll_window`;
@@ -125,8 +169,10 @@ keystrokes does.**
   clicks land in the wrong place.
 - **Geometry is the last reported position, not visibility.** With mpv
   fullscreen, kitty's geometry still sits at its tiled coordinates, so cropping
-  by it returns the mpv pixels covering that area. **`activate` first, then
-  capture.**
+  by it can return the mpv pixels covering that area. `screenshot_window`
+  prefers direct window capture and reports `capture.source`: `window` can show
+  the covered target itself, while `output_crop` shows the composited pixels.
+  **`activate` first when the image and what a click will hit must agree.**
 - **Workspace membership is reported.** `workspaces` lists the group, name and
   `active` flag; `on_active_workspace` is the short answer. When it is `false`,
   the window's geometry describes a workspace the output is not showing, so a
@@ -150,9 +196,9 @@ When the session is locked the tools do not fail loudly — they mislead:
 - `screenshot` now reports `screen_locked` (from logind) and `lock_evidence`;
   when capture is suspended it still times out with "timed out after 5s", and
   the error carries the lock state,
-- `screenshot_window` also reports `screen_locked`, but the crop can still be a
-  rectangle of **lock screen pixels**, because the window's geometry is
-  unaffected by what covers it,
+- `screenshot_window` also reports `screen_locked`. `capture.source=window` may
+  show the target itself despite the cover; `output_crop` can be a rectangle of
+  **lock screen pixels**, because the window's geometry is unaffected,
 - every window looks frozen: clicks land nowhere useful, and activating does
   nothing.
 
@@ -218,9 +264,10 @@ raw RON.
 
 | Symptom | Sequence |
 |---|---|
-| A widget will not accept a click | `window_action activate` → `screenshot_window` → pick (x,y) off that image → `click_window {window, x, y}` → screenshot again |
+| A widget will not accept a click | `window_action activate` → `screenshot_window` → pick (x,y) off that image → `click_window {window, x, y, coordinates}` → screenshot again |
 | Text lands in the wrong window | `window_action activate` → `type_text` |
-| A window screenshot shows something else | It is occluded or on another workspace: activate, then `screenshot_window` |
+| A window screenshot shows something else | Check `capture.source` and `on_active_workspace`; activate, then `screenshot_window` |
+| `screenshot_window` returns `needs_input_session` | `prepare_input` → ask the human to approve the dialog → `screenshot_window` again |
 | The click does nothing at all | Read the reply: `hit.window` (null = desktop), `on_active_workspace`, and `other_output_match` (wrong output's screenshot space). Use `click_window` for window images |
 | An applet looks wrong | `applets` for the PID → `app_logs` → `config_read` the config → `restart_applet` if needed (and say the whole section was rebuilt) |
 | Unsure about the desktop topology | `env_info` (no side effects). Do not guess |
@@ -229,7 +276,9 @@ raw RON.
 
 - Hardcoding absolute coordinates — breaks on any monitor or scale change.
 - Adding a `screenshot_window` origin to a point and calling `click` — use
-  `click_window` and pass the image point unchanged.
+  `click_window` with the image point and `coordinates` object unchanged.
+- Reconstructing or editing `coordinates` instead of passing the object from
+  the screenshot that supplied the point.
 - `click` followed directly by `type_text`.
 - Restarting applets with `kill`, or treating `restart_applet` as a targeted restart.
 - Writing cosmic-config without keeping the previous value.

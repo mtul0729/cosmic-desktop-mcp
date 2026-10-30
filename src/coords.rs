@@ -49,6 +49,61 @@ pub fn rect_contains(rect: Rect, x: i32, y: i32) -> bool {
     x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
 }
 
+/// Whether a direct toplevel capture covers the whole logical window.
+///
+/// The dimensions may differ by a uniform scale factor, but a missing
+/// server-side decoration changes only one axis and is therefore rejected.
+pub fn direct_frame_covers_logical(logical: Rect, width: u32, height: u32) -> bool {
+    if logical.width <= 0 || logical.height <= 0 || width == 0 || height == 0 {
+        return false;
+    }
+    let lhs = u64::from(width) * logical.height as u64;
+    let rhs = u64::from(height) * logical.width as u64;
+    lhs.abs_diff(rhs) <= u64::from(width.max(height))
+}
+
+/// A point in a direct window image -> desktop logical coordinates.
+pub fn direct_image_to_logical(
+    logical: Rect,
+    image: (u32, u32),
+    x: i32,
+    y: i32,
+) -> Result<(f64, f64)> {
+    check_image_point(image, x, y)?;
+    Ok((
+        f64::from(logical.x) + f64::from(x) * f64::from(logical.width) / f64::from(image.0),
+        f64::from(logical.y) + f64::from(y) * f64::from(logical.height) / f64::from(image.1),
+    ))
+}
+
+/// A point in a direct window image -> the output's screenshot pixels.
+pub fn direct_image_to_output(
+    pixels: Rect,
+    image: (u32, u32),
+    x: i32,
+    y: i32,
+) -> Result<(i32, i32)> {
+    check_image_point(image, x, y)?;
+    let scale_x = f64::from(pixels.width) / f64::from(image.0);
+    let scale_y = f64::from(pixels.height) / f64::from(image.1);
+    Ok((
+        pixels.x + (f64::from(x) * scale_x).round() as i32,
+        pixels.y + (f64::from(y) * scale_y).round() as i32,
+    ))
+}
+
+fn check_image_point(image: (u32, u32), x: i32, y: i32) -> Result<()> {
+    if x < 0 || y < 0 || x >= image.0 as i32 || y >= image.1 as i32 {
+        bail!(
+            "point ({x}, {y}) is outside the window image, which is {}x{}; take the point from a \
+             fresh screenshot_window — the window may have moved or been resized",
+            image.0,
+            image.1
+        );
+    }
+    Ok(())
+}
+
 /// A window's placement in all three spaces.
 #[derive(Clone, Debug)]
 pub struct WindowGeometry {
@@ -254,6 +309,47 @@ mod tests {
         assert!(err.contains("942x1008"), "{err}");
         assert!(geometry.window_to_output(0, 1008).is_err());
         assert!(geometry.window_to_output(-1, 0).is_err());
+    }
+
+    #[test]
+    fn direct_capture_accepts_logical_and_uniformly_scaled_frames() {
+        let logical = Rect {
+            x: 8,
+            y: 40,
+            width: 2032,
+            height: 1104,
+        };
+        assert!(direct_frame_covers_logical(logical, 2032, 1104));
+        assert!(direct_frame_covers_logical(logical, 2540, 1380));
+        assert!(!direct_frame_covers_logical(logical, 2032, 1068));
+    }
+
+    #[test]
+    fn direct_window_points_map_to_logical_and_output_pixels() {
+        let logical = Rect {
+            x: 8,
+            y: 40,
+            width: 2032,
+            height: 1104,
+        };
+        let pixels = Rect {
+            x: 10,
+            y: 50,
+            width: 2540,
+            height: 1380,
+        };
+        let image = (2032, 1104);
+        assert_eq!(
+            direct_image_to_logical(logical, image, 0, 0).unwrap(),
+            (8.0, 40.0)
+        );
+        let (x, y) = direct_image_to_logical(logical, image, 1016, 552).unwrap();
+        assert!((x - 1024.0).abs() < 1e-9);
+        assert!((y - 592.0).abs() < 1e-9);
+        assert_eq!(
+            direct_image_to_output(pixels, image, 1016, 552).unwrap(),
+            (1280, 740)
+        );
     }
 
     #[test]

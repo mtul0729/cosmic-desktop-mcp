@@ -19,9 +19,10 @@ Shell extension. None of that holds on COSMIC:
 | `gnome-desktop-mcp` | Needs a GNOME Shell 45-49 extension; irrelevant |
 | `ydotool` | Relative pointer plus acceleration; long jumps drift |
 
-Measured: `cosmic-comp 1.9.0` exposes 62 Wayland globals, and three of them are enough:
+Measured: `cosmic-comp 1.9.0` exposes 62 Wayland globals, and four of them are enough:
 
-- **Screenshots** — `ext_image_copy_capture_manager_v1` (staging), no dialog
+- **Screenshots** — `ext_image_copy_capture_manager_v1` and the output/window
+  `ext_image_capture_source_v1` managers (staging), no dialog
 - **Windows** — `ext_foreign_toplevel_list_v1` (staging), the same data `lswt` shows
 - **Keyboard and mouse** — EIS (libei), authorized through the portal's RemoteDesktop v2:
   coordinates are **logical pixels** spanning all outputs, so mixed scale factors are a
@@ -32,12 +33,12 @@ Measured: `cosmic-comp 1.9.0` exposes 62 Wayland globals, and three of them are 
   both multiple monitors and mixed scaling wrong. Removed wholesale on 2026-10-17; there
   is no fallback switch.
 
-## Status (measured 2026-10-17, pointer/workspace surface extended 2026-10-22)
+## Status (measured 2026-10-17, window capture updated 2026-10-31)
 
 | Capability | Status |
 |---|---|
 | `list_windows` | ✅ works, with state, geometry and workspace membership (see "Window geometry" for the measurements) |
-| `screenshot_window` | ✅ works; the crop is exact at DP-2's 1.25 scale, and the response carries the same geometry fields as `list_windows`. An occluded window needs `activate` first |
+| `screenshot_window` | ✅ works. Prefers direct foreign-toplevel capture and returns its native image without resizing. If COSMIC omits server-side decorations, the direct frame is rejected as coordinate-unsafe and the tool uses an output crop only when EIS is already open; otherwise it returns `needs_input_session` |
 | `window_action` | ✅ activate/close/maximize/minimize/fullscreen all take effect; the state array follows |
 | Pointer and keyboard (`click` / `move` / `scroll` / `click_window` / `move_window` / `scroll_window` / `type_text` / `key`) | ✅ over EIS (libei), no `/dev/uinput` needed. Every pointer call reports the output used and the window under the point |
 | Scroll direction | ✅ measured: positive `dy` scrolls up, negative down (the `REL_WHEEL` convention) |
@@ -56,13 +57,14 @@ locked.
 |---|---|---|
 | `screenshot` | Capture one output, save a PNG, return the path and `screen_locked` | ext-image-copy-capture + wl_shm |
 | `env_info` | Desktop topology + input backend status (no side effects, opens no EIS session) | wl_output + EIS region |
+| `prepare_input` | Open or reuse the EIS session and report its devices and output regions; may show the one-time portal dialog | RemoteDesktop portal + EIS |
 | `list_windows` | Window list + state + **geometry** (`logical` and screenshot-pixel coordinates) + workspace membership | ext-foreign-toplevel-list + zcosmic-toplevel-info |
-| `screenshot_window` | Find the window's output, capture it, crop the window, return its geometry in all three spaces | capture + zcosmic-toplevel-info + EIS region |
+| `screenshot_window` | Capture the target window directly; use an already-open EIS region only for an output-crop fallback; return a self-contained `coordinates` object | ext-image-capture-source + ext-image-copy-capture + zcosmic-toplevel-info |
 | `window_action` | activate / close / maximize / minimize / fullscreen and friends | zcosmic-toplevel-manager |
 | `click` | Click at **output screenshot** coordinates; reports the output used and the window under the point | EIS |
 | `move` | Hover at output screenshot coordinates | EIS |
 | `scroll` | Wheel at output screenshot coordinates; positive `dy` up, negative down | EIS |
-| `click_window` | Click at **window image** coordinates; resolves the window's output and crop origin itself | EIS + zcosmic-toplevel-info |
+| `click_window` | Click at **window image** coordinates using the matching `coordinates` object; resolves output and logical points itself | EIS + zcosmic-toplevel-info |
 | `move_window` | Hover at window image coordinates | EIS + zcosmic-toplevel-info |
 | `scroll_window` | Wheel at window image coordinates | EIS + zcosmic-toplevel-info |
 | `type_text` | **Clipboard + ctrl+v by default**; `mode:"keys"` sends keycodes instead | wl-clipboard + EIS |
@@ -76,6 +78,31 @@ locked.
 | `config_read` | Read a cosmic-config key (RON) | `~/.config/cosmic` |
 | `config_write` | Write or delete a cosmic-config key, returning the old value for rollback | `~/.config/cosmic` |
 
+## Observation, input, action
+
+The side-effect boundary is explicit:
+
+- **Observation** — `env_info`, `list_windows`, `screenshot`, `screenshot_window`.
+  These never open an EIS session and cannot raise the RemoteDesktop portal dialog.
+- **Input preparation** — `prepare_input` is the only status-like call that may open the
+  EIS session. On first use it can show the system authorization dialog and wait for a
+  human.
+- **Actions** — `click`, `move`, `scroll`, their `*_window` variants, `type_text` and
+  `key` still open EIS lazily on first use. They are actions, not queries.
+
+`screenshot_window` deliberately does not use EIS to discover scale. A direct
+foreign-toplevel capture is returned at its native size, with no resize. COSMIC may omit
+a server-side titlebar from that source (measured with kitty: 1264x636 while the logical
+window is 1264x672), which makes the image incomplete. The tool rejects such a frame
+instead of guessing. If an EIS session is already open it can fall back to an output crop;
+otherwise it returns the structured error `needs_input_session`. Call `prepare_input`,
+have the human approve, then take a fresh `screenshot_window`.
+
+Every successful window capture returns a `coordinates` object. Pass it unchanged to
+`click_window`, `move_window` or `scroll_window`; do not rebuild it, and do not add its
+origin to a point and call `click`. The action validates the window identity and the
+screenshot's freshness before using it.
+
 ## Coordinate spaces
 
 Three spaces appear in responses, and mixing them is the most expensive mistake this server
@@ -88,18 +115,20 @@ output 0". It cost an hour.
 |---|---|---|
 | **logical** | The compositor's desktop coordinates. A window's `logical` rect is relative to its output; EIS absolute input uses desktop-wide logical coordinates. | No MCP tool. `--eis-click` takes it. Everything else converts for you. |
 | **output screenshot pixels** | The PNG from `screenshot {output}`, at that output's physical resolution. | `click` / `move` / `scroll`, with the **same** `output` index. |
-| **window image pixels** | The PNG from `screenshot_window {window}`, a crop of the output at the window's origin. | `click_window` / `move_window` / `scroll_window`. |
+| **window image pixels** | The PNG from `screenshot_window {window}`, at its native direct-capture size or the output-crop size. Its `coordinates` object names the space. | `click_window` / `move_window` / `scroll_window`, together with that `coordinates` object. |
 
 The conversions are:
 
-- window image -> output screenshot: add the crop `origin`
+- direct window image -> output screenshot: scale each axis from the image size to the
+  window's output-pixel rect
+- output-crop image -> output screenshot: add the crop `origin`
 - output screenshot -> logical: divide by the output's real scale (from the EIS region,
   never `wl_output.scale`) and add the region's logical origin
 
 `click` defaults to output 0 and **does not infer the output from x/y**. If the point came
-from `screenshot_window`, use `click_window`: it resolves the window's output and crop origin
-internally, so there is no output index to get wrong and no arithmetic to do. That is the
-rule, not a convenience.
+from `screenshot_window`, use `click_window` and pass the matching `coordinates` object:
+it resolves the window's output and capture geometry internally, so there is no output index
+to get wrong and no arithmetic to do. That is the rule, not a convenience.
 
 Every pointer call now reports what it actually did: the output used, the logical point, and
 the window under the point (or null for the desktop), plus the workspace visibility of that
@@ -107,10 +136,19 @@ window. When the point is empty on the requested output but falls inside a windo
 output, the reply carries `other_output_match` with a warning — the exact signature of the
 output-index mistake.
 
-Window image pixels are a crop of the output screenshot, not the client's surface buffer:
-COSMIC's composited output is what the capture protocol returns, so the window image has the
-output's scale. `screenshot_window` reports `scale`, `logical`, `pixels` and `origin`, which
-is everything needed to see that without joining it to `list_windows`.
+`screenshot_window` prefers the compositor's direct foreign-toplevel capture source, so
+unrelated windows are never copied into the tool's buffer. COSMIC may return that source
+at logical size (verified: 2032x1104 for a window whose output-space crop is 2540x1380 at
+1.25 scale). The PNG is returned at that native size and is never resized.
+`capture.source` says which path ran (`window` or `output_crop`), `capture.native_size`
+records the direct source dimensions, and `capture.coordinate_safe` says whether it covers
+the whole logical window. `coordinates` carries the exact image size, logical rect and
+capture kind needed by the window input tools. `input_session_opened` is always `false` and
+`side_effects` is empty for this observation tool.
+
+Direct capture can show the target's content even while another window covers it. The
+`output_crop` fallback shows the composited pixels actually visible in that rectangle.
+Activate the target before clicking whenever visibility and the returned image must agree.
 
 The **workflow** an agent needs (run `env_info` first, `activate` before typing, never
 `kill` an applet — the ordering rules and the traps) is deliberately not in the tool
@@ -187,8 +225,9 @@ only in COSMIC's private `zcosmic_toplevel_info_v1` (v2+). Measurements:
   nothing arrives at all. The code therefore polls for at most 600 ms and stops as soon as
   the first geometry lands.
 - **Geometry is the last reported position, not visibility.** With mpv fullscreen, kitty's
-  geometry still sits at its tiled position, so cropping by it returns the mpv pixels
-  covering that area. For real content, `window_action activate` first.
+  geometry still sits at its tiled position. Direct window capture returns kitty itself,
+  while the `output_crop` fallback returns the mpv pixels covering that area. Activate
+  first when the image and the pixels a click will hit must agree.
 - **The states array works** (activated / maximized / minimized / fullscreen / sticky), and
   `window_action activate` really does move focus — which closes the "EIS clicks do not
   move keyboard focus" gap: click, then activate, then `type_text` lands in the window you
@@ -291,8 +330,9 @@ flake: `nix run github:mtul0729/cosmic-desktop-mcp`.
    `window_action {action:"activate"}` through zcosmic-toplevel-manager moves focus
    (verified), then `type_text`.
 3. **Geometry is the last reported position, not visibility.** When a window is covered
-   (fullscreen video) or on another workspace, cropping by its coordinates returns
-   whatever pixels are actually in that area. `list_windows` now reports
+   (fullscreen video) or on another workspace, direct capture can still show the target,
+   while the `output_crop` fallback returns whatever pixels are actually in that area.
+   `capture.source` says which happened. `list_windows` now reports
    `on_active_workspace` (and the workspace group/name) so the second case is visible
    before you click, and `click_window` warns when the target is not on the active
    workspace. For the first case, `window_action activate` first. Stacking order is not
@@ -318,16 +358,19 @@ blocking APIs. The tool catalogue is still authored as JSON Schema and converted
 coordinate and visibility traps, and a full `#[tool]` / `schemars` rewrite is a separate
 change from replacing the protocol implementation.
 
-Two limitations remain and should not be inferred from the SDK alone:
+When an input tool is waiting for the first RemoteDesktop authorization, it emits an MCP
+progress notification every two seconds if the client supplied `_meta.progressToken`.
+The notification tells the agent to ask the human to approve the dialog. If the dialog is
+ignored for 60 seconds, the tool returns an error with
+`structuredContent.status = "authorization_timeout"`. A cancellation or denial maps to
+`authorization_denied`; a missing or broken portal maps to `authorization_unavailable`.
+The text content contains the same diagnosis for clients that do not read structured
+content.
 
-- tool execution does not emit progress notifications while capturing or waiting for portal
-  authorization;
-- a running tool call is not cooperatively cancellable after it has entered the blocking
-  Wayland/portal code.
-
-Both need the individual tool implementations to expose checkpoints or async backends.
-Moving to rmcp makes those additions possible without replacing the transport again; it
-does not make blocking operations cancellable by itself.
+Two limitations remain: capture itself does not emit progress, and a running tool call is
+not cooperatively cancellable after it has entered blocking Wayland/portal code. The
+authorization heartbeat covers the wait a human is most likely to notice; it does not make
+capture cancellable.
 
 ## Install
 
@@ -446,9 +489,9 @@ Inside an MCP session the agent calls `env_info` and gets JSON:
   both sides lack a name does it fall back to physical size — and only when that matches
   exactly one region. **Two identical monitors (same physical size) are therefore an
   error**, instead of silently routing output 1's clicks to output 0 as before.
-- `input.connected`: whether an EIS session exists. When `false`, the notes say "the first
-  `click` raises a portal authorization dialog that a human must accept" — which is exactly
-  how the agent diagnoses "I clicked and nothing happened".
+- `input.connected`: whether an EIS session exists. When `false`, the notes say that the
+  first actual input action, or an explicit `prepare_input`, may raise a portal
+  authorization dialog that a human must accept.
 - `notes`: the coordinate convention (tools take screenshot pixels; the logical
   conversion happens inside).
 
@@ -486,6 +529,7 @@ Packaging details are in [NIX.md](NIX.md).
 ## Protocol references
 
 - `ext-image-copy-capture` — https://wayland.app/protocols/ext-image-copy-capture-v1
+- `ext-image-capture-source` — https://wayland.app/protocols/ext-image-capture-source-v1
 - `ext-foreign-toplevel-list` — https://wayland.app/protocols/ext-foreign-toplevel-list-v1
 - `ei` (libei) — https://libei.readthedocs.io/
 - `input-event-codes` — key/button code table, hand-written in `src/keymap.rs`, covering
