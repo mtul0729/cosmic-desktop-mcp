@@ -14,7 +14,8 @@ arithmetic.
 
 Protocol-level findings (how `zcosmic_toplevel_info_v1` pushes geometry, why
 cosmic-panel does not supervise its applets) live in the `cosmic-desktop-mcp`
-README. This file only covers *how to use the tools and what will bite you*.
+[engineering notes](../../docs/engineering-notes.md). This file only covers
+*how to use the tools and what will bite you*.
 
 ## Step 0: check the tools are actually there
 
@@ -223,9 +224,17 @@ Know what that costs: **it rebuilds the whole panel section**, so time,
 workspaces and audio on that section all come back with new PIDs. Using it as a
 single-applet restart quietly changes other things — tell the user afterwards.
 
-`app_logs {name}` reads an applet's stderr from `journalctl -t <name>`, where
-panics and warnings show up. That is the first place to look when an applet
-renders wrongly.
+Applet stderr goes to the user journal under the process name, where panics and
+warnings show up. That is the first place to look when an applet renders
+wrongly. This is a shell recipe rather than an MCP tool; use the name reported by
+`applets`:
+
+```bash
+journalctl --user -b --no-pager -n 100 -t cosmic-applet-time
+```
+
+Raise `-n` if the failure is further back, but keep the output bounded. If the
+name has no journal entries, check `applets` for the exact `argv[0]` basename.
 
 ## cosmic-config
 
@@ -269,7 +278,7 @@ raw RON.
 | A window screenshot shows something else | Check `capture.source` and `on_active_workspace`; activate, then `screenshot_window` |
 | `screenshot_window` returns `needs_input_session` | `prepare_input` → ask the human to approve the dialog → `screenshot_window` again |
 | The click does nothing at all | Read the reply: `hit.window` (null = desktop), `on_active_workspace`, and `other_output_match` (wrong output's screenshot space). Use `click_window` for window images |
-| An applet looks wrong | `applets` for the PID → `app_logs` → `config_read` the config → `restart_applet` if needed (and say the whole section was rebuilt) |
+| An applet looks wrong | `applets` for the PID and name → `journalctl --user -b -n 100 -t <name>` → `config_read` the config → `restart_applet` if needed (and say the whole section was rebuilt) |
 | Unsure about the desktop topology | `env_info` (no side effects). Do not guess |
 
 ## Anti-patterns

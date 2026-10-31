@@ -15,7 +15,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -358,35 +357,4 @@ fn backup(file: &Path, text: &str) -> Result<PathBuf> {
     let path = dir.join(format!("{name}__{key}"));
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
-}
-
-/// Recent journal lines for one applet. Applets inherit the session's stderr,
-/// so journald has them under the process name as identifier.
-pub fn logs(name: &str, lines: usize) -> Result<String> {
-    let lines = lines.clamp(1, 2000);
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        bail!("applet name {name:?} contains unexpected characters");
-    }
-    let output = Command::new("journalctl")
-        .args([
-            "--user",
-            "-b",
-            "--no-pager",
-            "-n",
-            &lines.to_string(),
-            "-t",
-            name,
-        ])
-        .output()
-        .with_context(|| format!("run journalctl for {name}"))?;
-    if !output.status.success() {
-        bail!(
-            "journalctl failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

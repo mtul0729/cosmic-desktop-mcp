@@ -554,20 +554,6 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             }
         },
         {
-            "name": "app_logs",
-            "description": "Recent stderr from one applet, straight out of the user journal \
-    (journalctl -t <name>). Applets inherit the session's stderr, so this is where their warnings and \
-    panics appear — the first place to look when a panel item misbehaves.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Applet process name, e.g. cosmic-applet-time."},
-                    "lines": {"type": "integer", "description": "How many lines to return. Default 50, max 2000."}
-                },
-                "required": ["name"]
-            }
-        },
-        {
             "name": "config_read",
             "description": "Read cosmic-config entries. COSMIC stores one setting per file as raw \
     RON text under ~/.config/cosmic/<app-id>/v1/<key>. Omit \"app\" to list app ids; omit \"key\" to \
@@ -624,7 +610,6 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
         "workspaces" => ToolResponse::success(tool_workspaces(args)?),
         "applets" => ToolResponse::success(tool_applets()?),
         "restart_applet" => ToolResponse::success(tool_restart_applet(args)?),
-        "app_logs" => ToolResponse::success(tool_app_logs(args)?),
         "config_read" => ToolResponse::success(tool_config_read(args)?),
         "config_write" => ToolResponse::success(tool_config_write(args)?),
         other => bail!("unknown tool {other:?}"),
@@ -861,15 +846,6 @@ fn tool_restart_applet(args: &Value) -> Result<String> {
         "note": "the panel respawned these from its plugins_* config, so the pids differ from the \
                  processes that existed before; the config key was restored to its original text",
     }))?)
-}
-
-fn tool_app_logs(args: &Value) -> Result<String> {
-    let name = args
-        .get("name")
-        .and_then(Value::as_str)
-        .context("app_logs needs \"name\"")?;
-    let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50) as usize;
-    applets::logs(name, lines)
 }
 
 fn tool_config_read(args: &Value) -> Result<String> {
@@ -2164,7 +2140,6 @@ mod tests {
                 "workspaces",
                 "applets",
                 "restart_applet",
-                "app_logs",
                 "config_read",
                 "config_write",
             ]
