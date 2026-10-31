@@ -1634,8 +1634,13 @@ fn window_point(
             }
             let (ox, oy) =
                 coords::direct_image_to_output(geometry.pixels, coordinates.image, x, y)?;
-            let (lx, ly) =
-                coords::direct_image_to_logical(coordinates.logical, coordinates.image, x, y)?;
+            let (lx, ly) = coords::direct_image_to_logical(
+                &geometry.region,
+                coordinates.logical,
+                coordinates.image,
+                x,
+                y,
+            )?;
             point_in_output(scene.output(geometry.output_index)?, ox, oy)?;
             (ox, oy, lx, ly)
         }
@@ -2429,8 +2434,8 @@ mod tests {
             height: 360,
         };
         let region = crate::eis::Region {
-            x: 0.0,
-            y: 0.0,
+            x: 384.0,
+            y: 1152.0,
             width: 1280,
             height: 720,
             scale: 1.5,
@@ -2482,7 +2487,7 @@ mod tests {
         .unwrap();
         let (_, _, ox, oy, lx, ly) = window_point(&scene, &coordinates, 640, 360).unwrap();
         assert_eq!((ox, oy), (495, 300));
-        assert_eq!((lx, ly), (330.0, 200.0));
+        assert_eq!((lx, ly), (714.0, 1352.0));
     }
 
     #[test]

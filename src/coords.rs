@@ -62,8 +62,12 @@ pub fn direct_frame_covers_logical(logical: Rect, width: u32, height: u32) -> bo
     lhs.abs_diff(rhs) <= u64::from(width.max(height))
 }
 
-/// A point in a direct window image -> desktop logical coordinates.
+/// A point in a direct window image -> output-relative logical coordinates.
+///
+/// Callers must add the output region's logical origin before sending the
+/// point to EIS, which uses desktop-wide logical coordinates.
 pub fn direct_image_to_logical(
+    region: &Region,
     logical: Rect,
     image: (u32, u32),
     x: i32,
@@ -71,8 +75,12 @@ pub fn direct_image_to_logical(
 ) -> Result<(f64, f64)> {
     check_image_point(image, x, y)?;
     Ok((
-        f64::from(logical.x) + f64::from(x) * f64::from(logical.width) / f64::from(image.0),
-        f64::from(logical.y) + f64::from(y) * f64::from(logical.height) / f64::from(image.1),
+        region.x
+            + f64::from(logical.x)
+            + f64::from(x) * f64::from(logical.width) / f64::from(image.0),
+        region.y
+            + f64::from(logical.y)
+            + f64::from(y) * f64::from(logical.height) / f64::from(image.1),
     ))
 }
 
@@ -326,6 +334,14 @@ mod tests {
 
     #[test]
     fn direct_window_points_map_to_logical_and_output_pixels() {
+        let region = Region {
+            x: 384.0,
+            y: 1152.0,
+            width: 1280,
+            height: 720,
+            scale: 1.5,
+            mapping_id: Some("eDP-1".into()),
+        };
         let logical = Rect {
             x: 8,
             y: 40,
@@ -340,12 +356,12 @@ mod tests {
         };
         let image = (2032, 1104);
         assert_eq!(
-            direct_image_to_logical(logical, image, 0, 0).unwrap(),
-            (8.0, 40.0)
+            direct_image_to_logical(&region, logical, image, 0, 0).unwrap(),
+            (392.0, 1192.0)
         );
-        let (x, y) = direct_image_to_logical(logical, image, 1016, 552).unwrap();
-        assert!((x - 1024.0).abs() < 1e-9);
-        assert!((y - 592.0).abs() < 1e-9);
+        let (x, y) = direct_image_to_logical(&region, logical, image, 1016, 552).unwrap();
+        assert!((x - 1408.0).abs() < 1e-9);
+        assert!((y - 1744.0).abs() < 1e-9);
         assert_eq!(
             direct_image_to_output(pixels, image, 1016, 552).unwrap(),
             (1280, 740)
