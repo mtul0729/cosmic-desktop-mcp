@@ -1,11 +1,11 @@
 # Tool reference
 
-**English** | [简体中文](tool-reference.zh-CN.md)
-
 This page describes the tools exposed by `cosmic-desktop-mcp` over MCP. Most tools return
-structured JSON text; log and clipboard reads return plain text, and simple actions return a
-short status line. Pointer and window tools also return enough context to verify what they
-did.
+structured JSON text; clipboard reads return plain text, and simple actions return a short
+status line. Pointer and window tools also return enough context to verify what they did.
+
+Optional arguments use their documented default only when omitted or `null`. A present
+value with the wrong type or range is an error, not a fallback to the default.
 
 ## Conventions
 
@@ -292,6 +292,9 @@ The original config text is restored and a backup is kept in
 `~/.local/state/cosmic-desktop-mcp/panel-backups/`. Do not use `kill`/`SIGTERM`; COSMIC does
 not reliably respawn an applet that was killed.
 
+Backups must succeed before any config is changed. Config writes are atomic, and an error
+during blanking or restoration triggers a best-effort restore through a drop guard.
+
 Applet logs are intentionally not an MCP tool. The
 [operations skill](../skill/cosmic-desktop-ops/SKILL.md) gives the `journalctl` recipe to use
 with the process name reported by `applets`.
@@ -321,11 +324,11 @@ file.
 Writes the value verbatim, so strings keep their quotes and enums keep their variant names.
 The response includes the previous value; keep it for rollback. Most COSMIC consumers
 watch the config tree, but an applet that reads only at startup may need
-`restart_applet`.
+`restart_applet`. A non-string, non-null `value` is rejected rather than treated as a
+deletion.
 
 ## Related documentation
 
 - [Quick start](../README.md)
 - [Scope and design principles](design.md)
-- [Chinese tool reference](tool-reference.zh-CN.md)
 - [Engineering notes](engineering-notes.md)

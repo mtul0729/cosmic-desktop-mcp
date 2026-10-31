@@ -117,7 +117,15 @@ pub fn write(app: &str, key: &str, value: Option<&str>) -> Result<Value> {
     let dir = app_dir(app)?;
     check_component("key", key)?;
     let path = dir.join(key);
-    let before = std::fs::read_to_string(&path).ok();
+    let before = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("read previous value from {} before writing", path.display())
+            });
+        }
+    };
 
     match value {
         Some(raw) => {
@@ -149,7 +157,7 @@ pub fn write(app: &str, key: &str, value: Option<&str>) -> Result<Value> {
 
 /// Writes through a temporary file in the same directory, so a watcher never
 /// observes a half-written value.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().context("config path has no parent")?;
     let tmp = dir.join(format!(
         ".{}.tmp",

@@ -1,7 +1,5 @@
 # Engineering notes
 
-[English](../README.md) | [简体中文](../README.zh-CN.md)
-
 This page preserves the protocol-level findings, measurements and implementation history
 that shaped `cosmic-desktop-mcp`. For installation and everyday usage, start with the
 [README](../README.md). For tool arguments, see the [tool reference](tool-reference.md).
@@ -273,7 +271,9 @@ Key points:
   which need not be the one just clicked.
 - Authorization uses `PersistMode::ExplicitlyRevoked`; the restore token lives in
   `$XDG_STATE_HOME/cosmic-desktop-mcp/restore-token`, after which every connection is
-  **silently approved**. The token can inject input — never commit it anywhere.
+  **silently approved**. The directory is kept at mode `0700` and the token at `0600`;
+  insecure existing permissions are tightened, and storage failures are surfaced in the
+  session detail. The token can inject input — never commit it anywhere.
 - A trap found while debugging: reis buffers requests locally, so **`connection.flush()`
   after every event-loop pass** is mandatory. Without it `ei_seat.bind` is never sent, and
   the symptom is "the seat arrived but no device ever does".

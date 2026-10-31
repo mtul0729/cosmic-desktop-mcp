@@ -1,7 +1,5 @@
 # cosmic-desktop-mcp
 
-**English** | [简体中文](README.zh-CN.md)
-
 A small open-source utility that exposes native COSMIC desktop operations over MCP: take
 screenshots, inspect windows and workspaces, move the pointer, click, scroll, and type. It
 talks to COSMIC's native Wayland protocols directly; X11 tools such as `xdotool` and
@@ -231,7 +229,9 @@ More recipes are in the [COSMIC desktop operations skill](skill/cosmic-desktop-o
 This server can observe and control your desktop. Only expose it to callers you trust.
 The RemoteDesktop restore token is stored at
 `$XDG_STATE_HOME/cosmic-desktop-mcp/restore-token` (with the usual state-directory
-fallback). It can authorize input injection, so treat it as a secret and never commit it.
+fallback). The containing directory is created with mode `0700` and the token with mode
+`0600`; permission or storage failures are reported in the input-session detail. It can
+authorize input injection, so treat it as a secret and never commit it.
 
 MCP is an interface, not a sandbox. Restricting a client to this server does not make
 desktop control safe or least-privilege.
@@ -242,8 +242,8 @@ before making disruptive changes.
 
 ## Documentation
 
-- [Tool reference](docs/tool-reference.md) / [工具参考](docs/tool-reference.zh-CN.md)
-- [Scope and design principles](docs/design.md) / [适用范围与设计原则](docs/design.zh-CN.md)
+- [Tool reference](docs/tool-reference.md)
+- [Scope and design principles](docs/design.md)
 - [Engineering notes](docs/engineering-notes.md) — protocol research, measurements and known traps
 - [Nix packaging notes](NIX.md)
 - [Agent operations skill](skill/cosmic-desktop-ops/SKILL.md)
@@ -257,9 +257,9 @@ cargo test
 cargo clippy
 ```
 
-If you rename a tool or change its arguments, update the tool definition, both tool
-reference files, and `skill/cosmic-desktop-ops/SKILL.md` together. Ordinary shell recipes
-belong in the skill; add an MCP tool only when the operation needs COSMIC-specific state or
+If you rename a tool or change its arguments, update the tool definition, the tool
+reference, and `skill/cosmic-desktop-ops/SKILL.md` together. Ordinary shell recipes belong
+in the skill; add an MCP tool only when the operation needs COSMIC-specific state or
 semantics.
 
 ## License

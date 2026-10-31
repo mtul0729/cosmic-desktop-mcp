@@ -1,7 +1,5 @@
 # Scope and design principles
 
-**English** | [简体中文](design.zh-CN.md)
-
 `cosmic-desktop-mcp` is a small open-source utility that exposes a focused set of COSMIC
 desktop operations over MCP. It is not a platform and does not try to provide a complete
 desktop automation stack.

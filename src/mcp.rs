@@ -618,7 +618,7 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
 }
 
 fn tool_screenshot(args: &Value) -> Result<String> {
-    let index = args.get("output").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let index = output_arg(args)?;
     let lock = lockstate::detect();
     let shot = capture::capture(index).with_context(|| {
         format!(
@@ -796,14 +796,15 @@ fn tool_prepare_input() -> Result<String> {
 }
 
 fn tool_workspaces(args: &Value) -> Result<String> {
-    let list = match args.get("activate").and_then(Value::as_str) {
-        Some(target) => {
-            let group = args
-                .get("group")
-                .and_then(Value::as_u64)
-                .map(|index| index as usize);
-            workspace::activate(target, group)?
-        }
+    let activate = optional_string_arg(args, "activate")?;
+    let group = optional_u64_arg(args, "group")?
+        .map(|index| usize::try_from(index).context("workspace group index is out of range"))
+        .transpose()?;
+    if activate.is_none() && group.is_some() {
+        bail!("workspaces \"group\" requires \"activate\"");
+    }
+    let list = match activate {
+        Some(target) => workspace::activate(target, group)?,
         None => workspace::list()?,
     };
     let groups = list
@@ -849,8 +850,11 @@ fn tool_restart_applet(args: &Value) -> Result<String> {
 }
 
 fn tool_config_read(args: &Value) -> Result<String> {
-    let app = args.get("app").and_then(Value::as_str);
-    let key = args.get("key").and_then(Value::as_str);
+    let app = optional_string_arg(args, "app")?;
+    let key = optional_string_arg(args, "key")?;
+    if app.is_none() && key.is_some() {
+        bail!("config_read \"key\" requires \"app\"");
+    }
     Ok(serde_json::to_string_pretty(&config::read(app, key)?)?)
 }
 
@@ -863,8 +867,16 @@ fn tool_config_write(args: &Value) -> Result<String> {
         .get("key")
         .and_then(Value::as_str)
         .context("config_write needs \"key\"")?;
-    // A missing or null value means "delete this key".
-    let value = args.get("value").and_then(Value::as_str);
+    // A missing or null value means "delete this key"; any other type is an
+    // error, not an implicit deletion.
+    let value = match args.get("value") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(other) => bail!(
+            "config_write \"value\" must be a string or null, got {}",
+            value_kind(other)
+        ),
+    };
     Ok(serde_json::to_string_pretty(&config::write(
         app, key, value,
     )?)?)
@@ -1459,17 +1471,22 @@ fn tool_window_action(args: &Value) -> Result<String> {
 }
 
 fn button_arg(args: &Value) -> Result<Button> {
-    match args.get("button").and_then(Value::as_str) {
-        Some(name) => Button::parse(name),
-        None => Ok(Button::Left),
+    match args.get("button") {
+        None | Some(Value::Null) => Ok(Button::Left),
+        Some(Value::String(name)) => Button::parse(name),
+        Some(other) => bail!(
+            "button must be \"left\", \"right\" or \"middle\", got {}",
+            value_kind(other)
+        ),
     }
 }
 
-fn count_arg(args: &Value) -> u32 {
-    args.get("count")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1) as u32
+fn count_arg(args: &Value) -> Result<u32> {
+    match optional_u64_arg(args, "count")?.unwrap_or(1) {
+        1 => Ok(1),
+        2 => Ok(2),
+        count => bail!("count must be 1 or 2, got {count}"),
+    }
 }
 
 fn window_arg<'a>(args: &'a Value, tool: &str) -> Result<&'a str> {
@@ -1658,8 +1675,8 @@ fn tool_click(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
     let button = button_arg(args)?;
-    let count = count_arg(args);
-    let output = output_arg(args);
+    let count = count_arg(args)?;
+    let output = output_arg(args)?;
 
     let scene = Scene::load(true)?;
     let out = scene.output(output)?;
@@ -1698,7 +1715,7 @@ fn tool_click(args: &Value) -> Result<String> {
 fn tool_move(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    let output = output_arg(args);
+    let output = output_arg(args)?;
 
     let scene = Scene::load(true)?;
     let out = scene.output(output)?;
@@ -1735,9 +1752,9 @@ fn tool_move(args: &Value) -> Result<String> {
 fn tool_scroll(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
-    let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
-    let output = output_arg(args);
+    let dy = optional_i32_arg(args, "dy")?.unwrap_or(0);
+    let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
+    let output = output_arg(args)?;
 
     let scene = Scene::load(true)?;
     let out = scene.output(output)?;
@@ -1778,7 +1795,7 @@ fn tool_click_window(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
     let button = button_arg(args)?;
-    let count = count_arg(args);
+    let count = count_arg(args)?;
     let coordinates = window_coordinates_arg(args)?;
 
     let windows = toplevel::list()?;
@@ -1897,8 +1914,8 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
     let needle = window_arg(args, "scroll_window")?;
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    let dy = args.get("dy").and_then(Value::as_i64).unwrap_or(0) as i32;
-    let dx = args.get("dx").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let dy = optional_i32_arg(args, "dy")?.unwrap_or(0);
+    let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
     let coordinates = window_coordinates_arg(args)?;
 
     let windows = toplevel::list()?;
@@ -1964,7 +1981,7 @@ fn tool_type_text(args: &Value) -> Result<String> {
         return Ok("nothing to type".to_string());
     }
 
-    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("paste");
+    let mode = optional_string_arg(args, "mode")?.unwrap_or("paste");
     match mode {
         // Keycodes go through the compositor's input pipeline, which hands
         // them to whatever input method is active. With fcitx5 running, "abc"
@@ -2029,8 +2046,60 @@ fn press_chord(combo: &str) -> Result<()> {
     input::chord(combo)
 }
 
-fn output_arg(args: &Value) -> usize {
-    args.get("output").and_then(Value::as_u64).unwrap_or(0) as usize
+fn output_arg(args: &Value) -> Result<usize> {
+    let output = optional_u64_arg(args, "output")?.unwrap_or(0);
+    usize::try_from(output).context("output index is out of range")
+}
+
+fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(other) => bail!(
+            "argument {key:?} must be a string, got {}",
+            value_kind(other)
+        ),
+    }
+}
+
+fn optional_u64_arg(args: &Value, key: &str) -> Result<Option<u64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).with_context(|| {
+            format!(
+                "argument {key:?} must be a non-negative integer, got {}",
+                value_kind(value)
+            )
+        }),
+    }
+}
+
+fn optional_i32_arg(args: &Value, key: &str) -> Result<Option<i32>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let value = value.as_i64().with_context(|| {
+                format!(
+                    "argument {key:?} must be an integer, got {}",
+                    value_kind(value)
+                )
+            })?;
+            Ok(Some(i32::try_from(value).with_context(|| {
+                format!("argument {key:?} is out of range")
+            })?))
+        }
+    }
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn int_arg(args: &Value, key: &str) -> Result<i32> {
@@ -2233,6 +2302,46 @@ mod tests {
                 .and_then(Value::as_str),
             Some("needs_input_session")
         );
+    }
+
+    #[test]
+    fn invalid_arguments_are_errors_instead_of_silent_defaults() {
+        assert_eq!(output_arg(&json!({})).unwrap(), 0);
+        assert!(output_arg(&json!({"output": -1})).is_err());
+        assert!(output_arg(&json!({"output": "0"})).is_err());
+
+        assert_eq!(count_arg(&json!({})).unwrap(), 1);
+        assert_eq!(count_arg(&json!({"count": 2})).unwrap(), 2);
+        assert!(count_arg(&json!({"count": 3})).is_err());
+        assert!(count_arg(&json!({"count": "1"})).is_err());
+
+        assert!(button_arg(&json!({"button": 1})).is_err());
+        assert!(optional_i32_arg(&json!({"dy": "1"}), "dy").is_err());
+        assert!(optional_string_arg(&json!({"mode": 1}), "mode").is_err());
+
+        let err = tool_config_write(&json!({
+            "app": "com.system76.CosmicAppletTime",
+            "key": "military_time",
+            "value": 1
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be a string or null"), "{err}");
+
+        let err = tool_type_text(&json!({"text": "x", "mode": 1}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mode"), "{err}");
+
+        let err = tool_workspaces(&json!({"group": 1}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires \"activate\""), "{err}");
+
+        let err = tool_config_read(&json!({"key": "military_time"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires \"app\""), "{err}");
     }
 
     #[test]

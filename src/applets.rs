@@ -160,9 +160,9 @@ fn age_seconds(pid: u32) -> Option<u64> {
 /// and then written back, which is the only thing observed to make the panel
 /// respawn an applet. In practice the panel then rebuilds **every** applet on
 /// that section — time, workspaces and audio all come back with new pids — so
-/// this is a panel refresh, not a single-applet restart. The original text is
-/// written back unconditionally, even when the respawn does not show up in
-/// time.
+/// this is a panel refresh, not a single-applet restart. Backups are written
+/// before any config is touched, and a drop guard restores the original text
+/// if blanking or the respawn path returns early.
 pub fn restart(selector: &str) -> Result<Vec<Applet>> {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -202,21 +202,45 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
         );
     }
 
-    // Keep a copy outside the config tree: if writing back fails halfway, the
-    // user can still recover a whole panel section by hand.
+    // Keep a copy outside the config tree before touching anything.
     for (file, text) in &targets {
-        let _ = backup(file, text);
-        std::fs::write(file, "None").with_context(|| format!("blank {}", file.display()))?;
+        backup(file, text)
+            .with_context(|| format!("back up {} before blanking it", file.display()))?;
+    }
+
+    let mut restore = PanelRestore::new(targets);
+    let files: Vec<PathBuf> = restore
+        .targets
+        .iter()
+        .map(|(file, _)| file.clone())
+        .collect();
+    for file in &files {
+        if let Err(err) = crate::config::write_atomic(file, "None") {
+            let restore_failures = restore.restore();
+            if restore_failures.is_empty() {
+                bail!(
+                    "failed to blank {}: {err:#}; the panel config was restored from backups in {}",
+                    file.display(),
+                    backup_dir()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
+            bail!(
+                "failed to blank {}: {err:#}; FAILED to restore the panel config: {}. Backups are \
+                 in {}",
+                file.display(),
+                restore_failures.join("; "),
+                backup_dir()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
     }
     // The config watcher debounces, so give it time to see the blank value.
     std::thread::sleep(Duration::from_millis(1200));
 
-    let mut restore_failures = Vec::new();
-    for (file, text) in &targets {
-        if let Err(err) = std::fs::write(file, text) {
-            restore_failures.push(format!("{}: {err}", file.display()));
-        }
-    }
+    let restore_failures = restore.restore();
     if !restore_failures.is_empty() {
         bail!(
             "FAILED to restore the panel config after blanking it — the panel is now missing the \
@@ -246,12 +270,50 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
             bail!(
                 "rewrote {} but the {selector:?} processes were not replaced within 10s; the \
                  config has been restored, so they should come back on the next panel reload",
-                targets
+                files
                     .iter()
-                    .map(|(file, _)| file.display().to_string())
+                    .map(|file| file.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+        }
+    }
+}
+
+/// Restores the original panel config on every early return, including a panic
+/// during the debounce wait. Explicit restoration still reports failures; if it
+/// fails, `Drop` makes one more best-effort attempt.
+struct PanelRestore {
+    targets: Vec<(PathBuf, String)>,
+    armed: bool,
+}
+
+impl PanelRestore {
+    fn new(targets: Vec<(PathBuf, String)>) -> Self {
+        Self {
+            targets,
+            armed: true,
+        }
+    }
+
+    fn restore(&mut self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (file, text) in &self.targets {
+            if let Err(err) = crate::config::write_atomic(file, text) {
+                failures.push(format!("{}: {err:#}", file.display()));
+            }
+        }
+        if failures.is_empty() {
+            self.armed = false;
+        }
+        failures
+    }
+}
+
+impl Drop for PanelRestore {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.restore();
         }
     }
 }
@@ -357,4 +419,63 @@ fn backup(file: &Path, text: &str) -> Result<PathBuf> {
     let path = dir.join(format!("{name}__{key}"));
     std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cosmic-desktop-mcp-applets-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn panel_restore_puts_the_original_config_back() {
+        let temp = TempDir::new();
+        let file = temp.0.join("plugins_center");
+        std::fs::write(&file, "[\"com.system76.CosmicAppletTime\"]").unwrap();
+        let original = std::fs::read_to_string(&file).unwrap();
+
+        let mut restore = PanelRestore::new(vec![(file.clone(), original.clone())]);
+        crate::config::write_atomic(&file, "None").unwrap();
+
+        assert!(restore.restore().is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        assert!(!restore.armed);
+    }
+
+    #[test]
+    fn panel_restore_drop_recovers_an_armed_transaction() {
+        let temp = TempDir::new();
+        let file = temp.0.join("plugins_wings");
+        let original = "[\"com.system76.CosmicAppletAudio\"]".to_string();
+        std::fs::write(&file, &original).unwrap();
+
+        {
+            let _restore = PanelRestore::new(vec![(file.clone(), original.clone())]);
+            crate::config::write_atomic(&file, "None").unwrap();
+        }
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
 }

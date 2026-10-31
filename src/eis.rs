@@ -22,8 +22,11 @@
 //! the shared `Connection`. Buffering commands behind the blocking event read
 //! is not an option: that read has no timeout of its own.
 
+use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -73,6 +76,7 @@ pub struct Session {
     connection: Connection,
     state: Arc<Mutex<State>>,
     alive: Arc<AtomicBool>,
+    token_warning: Option<String>,
 }
 
 #[derive(Default)]
@@ -266,6 +270,9 @@ impl Session {
                 region.mapping_id, region.x, region.y, region.width, region.height, region.scale
             ));
         }
+        if let Some(warning) = &self.token_warning {
+            out.push(format!("warning: {warning}"));
+        }
         out
     }
 
@@ -318,13 +325,16 @@ fn run(ready: Sender<Result<Session>>, alive: Arc<AtomicBool>) {
         }
     };
 
-    let context = match runtime.block_on(open_session()) {
-        Ok(context) => context,
+    let (context, token_warning) = match runtime.block_on(open_session()) {
+        Ok(opened) => opened,
         Err(err) => {
             fail(ready, alive, err.context("open an EIS session"));
             return;
         }
     };
+    if let Some(warning) = &token_warning {
+        eprintln!("eis: {warning}");
+    }
 
     let (connection, events) = match context
         .handshake_blocking("cosmic-desktop-mcp", ei::handshake::ContextType::Sender)
@@ -363,6 +373,7 @@ fn run(ready: Sender<Result<Session>>, alive: Arc<AtomicBool>) {
                     connection: connection.clone(),
                     state: Arc::clone(&state),
                     alive: Arc::clone(&alive),
+                    token_warning: token_warning.clone(),
                 };
                 if let Some(tx) = ready.take() {
                     let _ = tx.send(Ok(session));
@@ -469,7 +480,7 @@ fn monotonic_us() -> u64 {
     (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
 }
 
-async fn open_session() -> Result<ei::Context> {
+async fn open_session() -> Result<(ei::Context, Option<String>)> {
     let portal = RemoteDesktop::new()
         .await
         .context("connect to the RemoteDesktop portal")?;
@@ -479,12 +490,13 @@ async fn open_session() -> Result<ei::Context> {
         .await
         .context("create portal session")?;
 
+    let (restore_token, mut warning) = load_token();
     let options = SelectDevicesOptions::default()
         .set_devices(DeviceType::Pointer | DeviceType::Keyboard)
         // The token only survives if the session may persist; `DoNot` throws
         // it away and every start would pop the dialog again.
         .set_persist_mode(PersistMode::ExplicitlyRevoked)
-        .set_restore_token(load_token().as_deref());
+        .set_restore_token(restore_token.as_deref());
     portal
         .select_devices(&session, options)
         .await
@@ -498,20 +510,28 @@ async fn open_session() -> Result<ei::Context> {
         .context("start portal session")?
         .response()
         .context("the portal did not grant the session")?;
-    if let Some(token) = granted.restore_token() {
-        store_token(token);
+    if let Some(token) = granted.restore_token()
+        && let Err(err) = store_token(token)
+    {
+        append_warning(
+            &mut warning,
+            format!("could not persist restore token: {err:#}"),
+        );
     }
 
     let fd = portal
         .connect_to_eis(&session, ConnectToEISOptions::default())
         .await
         .context("connect to EIS")?;
-    ei::Context::new(UnixStream::from(fd)).context("wrap the EIS socket")
+    Ok((
+        ei::Context::new(UnixStream::from(fd)).context("wrap the EIS socket")?,
+        warning,
+    ))
 }
 
 /// `$XDG_STATE_HOME/cosmic-desktop-mcp/restore-token`, falling back to
-/// `~/.local/state/...`. The token is per-user and not a secret in the
-/// password sense, but it does grant remote input — keep it out of the repo.
+/// `~/.local/state/...`. The token grants remote input, so the file and its
+/// directory are kept private.
 fn token_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -521,19 +541,196 @@ fn token_path() -> Option<PathBuf> {
     Some(base.join("cosmic-desktop-mcp/restore-token"))
 }
 
-fn load_token() -> Option<String> {
-    let path = token_path()?;
-    let token = std::fs::read_to_string(path).ok()?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_owned())
+fn load_token() -> (Option<String>, Option<String>) {
+    let Some(path) = token_path() else {
+        return (None, None);
+    };
+    load_token_at(&path)
 }
 
-fn store_token(token: &str) {
-    let Some(path) = token_path() else { return };
-    if let Some(dir) = path.parent()
-        && std::fs::create_dir_all(dir).is_err()
-    {
-        return;
+fn load_token_at(path: &Path) -> (Option<String>, Option<String>) {
+    let mut warning = None;
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                match std::fs::set_permissions(path, Permissions::from_mode(0o600)) {
+                    Ok(()) => append_warning(
+                        &mut warning,
+                        format!(
+                            "restore token at {} had permissions {mode:03o}; tightened to 600",
+                            path.display()
+                        ),
+                    ),
+                    Err(err) => append_warning(
+                        &mut warning,
+                        format!(
+                            "restore token at {} has permissions {mode:03o} and could not be \
+                             tightened to 600: {err}",
+                            path.display()
+                        ),
+                    ),
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            append_warning(
+                &mut warning,
+                format!(
+                    "could not inspect restore token at {}: {err}",
+                    path.display()
+                ),
+            );
+            return (None, warning);
+        }
     }
-    let _ = std::fs::write(&path, token);
+
+    match std::fs::read_to_string(path) {
+        Ok(token) => {
+            let token = token.trim();
+            ((!token.is_empty()).then(|| token.to_owned()), warning)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, warning),
+        Err(err) => {
+            append_warning(
+                &mut warning,
+                format!("could not read restore token at {}: {err}", path.display()),
+            );
+            (None, warning)
+        }
+    }
+}
+
+fn store_token(token: &str) -> Result<()> {
+    let path = token_path().context("neither XDG_STATE_HOME nor HOME is set")?;
+    let dir = path.parent().context("restore token path has no parent")?;
+    create_private_dir(dir)?;
+    write_private_file(&path, token)
+}
+
+fn create_private_dir(dir: &Path) -> Result<()> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, Permissions::from_mode(0o700))
+        .with_context(|| format!("make {} private", dir.display()))
+}
+
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().context("private file path has no parent")?;
+    let tmp = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        path.file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        monotonic_us()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.set_permissions(Permissions::from_mode(0o600))
+            .with_context(|| format!("make {} private", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+        std::fs::set_permissions(path, Permissions::from_mode(0o600))
+            .with_context(|| format!("make {} private", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn append_warning(slot: &mut Option<String>, warning: String) {
+    if let Some(existing) = slot {
+        existing.push_str("; ");
+        existing.push_str(&warning);
+    } else {
+        *slot = Some(warning);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cosmic-desktop-mcp-eis-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn restore_token_file_is_private() {
+        let temp = TempDir::new();
+        let path = temp.0.join("restore-token");
+
+        write_private_file(&path, "secret-token").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "secret-token");
+    }
+
+    #[test]
+    fn restore_token_directory_is_private() {
+        let temp = TempDir::new();
+        let dir = temp.0.join("nested/cosmic-desktop-mcp");
+
+        create_private_dir(&dir).unwrap();
+
+        let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn load_token_tightens_insecure_permissions() {
+        let temp = TempDir::new();
+        let path = temp.0.join("restore-token");
+        std::fs::write(&path, "secret-token").unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+
+        let (token, warning) = load_token_at(&path);
+
+        assert_eq!(token.as_deref(), Some("secret-token"));
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("tightened to 600"))
+        );
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
