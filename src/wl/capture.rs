@@ -575,7 +575,7 @@ fn wait(
         queue
             .roundtrip(state)
             .context("roundtrip while waiting for capture")?;
-        conn.flush().ok();
+        conn.flush().context("flush while waiting for capture")?;
         std::thread::sleep(Duration::from_millis(2));
     }
     Ok(())
