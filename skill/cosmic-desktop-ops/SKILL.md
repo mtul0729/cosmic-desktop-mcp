@@ -58,8 +58,8 @@ The tools have three deliberate layers:
 - **Preparation:** `prepare_input`. This may open EIS and show the one-time
   system authorization dialog. It is the only status-like tool with that side
   effect.
-- **Actions:** `click`, `move`, `scroll`, their `_window` variants,
-  `type_text`, `key`. These open EIS lazily on first use.
+- **Actions:** `window_action`, `click`, `move`, `scroll`, their `_window`
+  variants, `type_text`, `key`. Input actions open EIS lazily on first use.
 
 If a tool needs authorization, ask the human to approve the system dialog. When
 the client supplies `_meta.progressToken`, the server emits a progress
@@ -141,7 +141,7 @@ to output pixels and logical coordinates and says which ones it used.
 4. **take another screenshot to confirm.** Never assume an action landed: the
    compositor is free to ignore requests (see below).
 
-For a read-only probe use `move` (hover) instead of `click`. There is no
+For a non-clicking probe use `move` (hover) instead of `click`. There is no
 clipboard-read MCP tool; use `wl-paste --no-newline` from a shell when the
 clipboard contents are relevant.
 

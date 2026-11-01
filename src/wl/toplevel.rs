@@ -674,8 +674,9 @@ fn connect(with_manager: bool) -> Result<Snapshot> {
     let (globals, mut queue) = registry_queue_init::<State>(&conn).context("registry init")?;
     let qh = queue.handle();
 
-    // v2 is the minimum that carries geometry; binding below v3 keeps the
-    // ext_workspace_* events out of the picture until something uses them.
+    // v2 is the minimum that carries geometry. Request v3 when available for
+    // workspace membership; the optional workspace manager resolves those ids
+    // to names and active state.
     let info: ZcosmicToplevelInfoV1 = globals.bind(&qh, 2..=3, ()).context(
         "bind zcosmic_toplevel_info_v1 v2 (does this compositor have the COSMIC protocols?)",
     )?;

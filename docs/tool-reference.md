@@ -26,8 +26,8 @@ than picking one. Use the identifier for repeated terminal windows and similar c
 - **Observation:** `env_info`, `list_windows`, `screenshot`, `screenshot_window`. These do
   not open the EIS input session.
 - **Preparation:** `prepare_input`. This may show the RemoteDesktop authorization dialog.
-- **Actions:** pointer, keyboard, workspace, applet and config tools. Input actions open EIS
-  lazily on first use and may therefore show the same dialog.
+- **Actions:** `window_action`, pointer, keyboard, workspace, applet and config tools. Input
+  actions open EIS lazily on first use and may therefore show the same dialog.
 
 The server emits MCP progress notifications every two seconds while waiting for
 authorization when the client supplies `_meta.progressToken`. Timeout, denial and portal
@@ -178,7 +178,7 @@ be sent with that monitor's output index. Use `click_window` for a point taken f
 | `x`, `y` | integer | required | Pixel coordinates from `screenshot` |
 | `output` | integer | `0` | Output index for those coordinates |
 
-Moves the pointer without clicking. Useful for hover state and as a read-only probe.
+Moves the pointer without clicking. Useful for hover state and as a non-clicking probe.
 
 ### `scroll`
 

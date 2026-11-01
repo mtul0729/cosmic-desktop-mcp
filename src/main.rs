@@ -6,7 +6,7 @@
 //!   - `wl::workspace`   ext_workspace_manager_v1
 //!   - `input`           EIS/libei through the RemoteDesktop portal
 //!   - `keymap`          linux key/button codes (US layout)
-//!   - `applets`         panel applets as processes (panel supervises them)
+//!   - `applets`         panel applets as processes started by cosmic-panel
 //!   - `config`          cosmic-config RON entries on disk
 
 mod applets;

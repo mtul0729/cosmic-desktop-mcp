@@ -293,9 +293,11 @@ Key points:
   so capture both outputs when hunting for one; to place a window on a specific output,
   click that output first.
 
-The MCP tool layer switched to EIS on 2026-10-17: `src/input.rs` speaks EIS only, the
-session is long-lived (`EiEvent` is not `Send`, so it owns a thread fed by a command
-channel), the key table lives in `src/keymap.rs`, and `/dev/uinput` is gone entirely.
+The MCP tool layer switched to EIS on 2026-10-17: `src/input.rs` speaks EIS only, and the
+session is long-lived. `EiEvent` is not `Send`, so a dedicated thread owns the event
+iterator and publishes shared device state plus the connection; tool calls use the shared
+device handles and flush the connection. The key table lives in `src/keymap.rs`, and
+`/dev/uinput` is gone entirely.
 
 ## Releasing
 
@@ -359,9 +361,9 @@ The server supports every protocol revision known to rmcp 3.8, from `2024-11-05`
 `2026-07-28`, and negotiates the client's requested version. Tool calls run on Tokio's
 blocking pool because Wayland, the portal, image encoding and the shell-based helpers are
 blocking APIs. The tool catalogue is still authored as JSON Schema and converted to
-`rmcp::model::Tool` at startup. That is deliberate: the descriptions encode COSMIC-specific
-coordinate and visibility traps, and a full `#[tool]` / `schemars` rewrite is a separate
-change from replacing the protocol implementation.
+`rmcp::model::Tool` at startup. That is deliberate: the schemas and descriptions encode
+COSMIC-specific argument semantics and coordinate constraints, and a full `#[tool]` /
+`schemars` rewrite is a separate change from replacing the protocol implementation.
 
 When an input tool is waiting for the first RemoteDesktop authorization, it emits an MCP
 progress notification every two seconds if the client supplied `_meta.progressToken`.
