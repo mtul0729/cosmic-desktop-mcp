@@ -354,7 +354,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "description": "Scroll the wheel at (x,y) in the screenshot pixel space of the chosen \
     output (default 0, never inferred from x/y). Positive dy scrolls UP (reveals earlier content, \
     matching the kernel REL_WHEEL convention), negative dy scrolls down; positive dx scrolls right. \
-    The reply reports the output used and the window under the point.",
+    At least one of dx or dy must be non-zero. The reply reports the output used and the window \
+    under the point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -434,8 +435,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         {
             "name": "scroll_window",
             "description": "Scroll the wheel at (x,y) in the image returned by screenshot_window. \
-    Positive dy scrolls UP, negative down; positive dx scrolls right. Pass that result's \
-    \"coordinates\" object unchanged.",
+    Positive dy scrolls UP, negative down; positive dx scrolls right; at least one must be \
+    non-zero. Pass that result's \"coordinates\" object unchanged.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -591,7 +592,23 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
 }
 
 fn reject_unknown_args(tool: &str, args: &Value) -> Result<()> {
-    let allowed: &[&str] = match tool {
+    let Some(allowed) = allowed_tool_args(tool) else {
+        return Ok(());
+    };
+    let arguments = args
+        .as_object()
+        .context("tool arguments must be a JSON object")?;
+    if let Some(unknown) = arguments
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        bail!("unknown argument {unknown:?} for tool {tool:?}");
+    }
+    Ok(())
+}
+
+fn allowed_tool_args(tool: &str) -> Option<&'static [&'static str]> {
+    Some(match tool {
         "screenshot" => &["output"],
         "env_info" | "prepare_input" | "list_windows" | "applets" => &[],
         "screenshot_window" => &["window"],
@@ -608,18 +625,8 @@ fn reject_unknown_args(tool: &str, args: &Value) -> Result<()> {
         "restart_applet" => &["name"],
         "config_read" => &["app", "key"],
         "config_write" => &["app", "key", "value"],
-        _ => return Ok(()),
-    };
-    let arguments = args
-        .as_object()
-        .context("tool arguments must be a JSON object")?;
-    if let Some(unknown) = arguments
-        .keys()
-        .find(|key| !allowed.contains(&key.as_str()))
-    {
-        bail!("unknown argument {unknown:?} for tool {tool:?}");
-    }
-    Ok(())
+        _ => return None,
+    })
 }
 
 fn tool_screenshot(args: &Value) -> Result<String> {
@@ -1885,8 +1892,7 @@ fn tool_move(args: &Value) -> Result<String> {
 fn tool_scroll(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    let dy = optional_i32_arg(args, "dy")?.unwrap_or(0);
-    let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
+    let (dx, dy) = scroll_delta(args)?;
     let output = output_arg(args)?;
 
     let scene = load_scene_for_output(output, x, y)?;
@@ -2058,8 +2064,7 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
     let needle = window_arg(args, "scroll_window")?;
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
-    let dy = optional_i32_arg(args, "dy")?.unwrap_or(0);
-    let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
+    let (dx, dy) = scroll_delta(args)?;
     let coordinates = window_coordinates_arg(args)?;
     coords::check_image_point(coordinates.image, x, y)?;
 
@@ -2126,11 +2131,17 @@ fn tool_type_text(args: &Value) -> Result<String> {
         .get("text")
         .and_then(Value::as_str)
         .context("missing text")?;
+    let mode = optional_string_arg(args, "mode")?.unwrap_or("paste");
+    if !matches!(mode, "paste" | "keys") {
+        bail!("unknown mode {mode:?}; expected \"paste\" or \"keys\"");
+    }
     if text.is_empty() {
         let (locked, lock_evidence, notes) = lock_notes();
         return Ok(serde_json::to_string_pretty(&json!({
             "action": "type_text",
+            "mode": mode,
             "characters": 0,
+            "clipboard_overwritten": false,
             "screen_locked": locked,
             "lock_evidence": lock_evidence,
             "verified": true,
@@ -2138,7 +2149,6 @@ fn tool_type_text(args: &Value) -> Result<String> {
         }))?);
     }
 
-    let mode = optional_string_arg(args, "mode")?.unwrap_or("paste");
     let (locked, lock_evidence, mut notes) = lock_notes();
     notes.push(INPUT_VERIFICATION_NOTE.to_string());
     match mode {
@@ -2186,7 +2196,7 @@ fn tool_type_text(args: &Value) -> Result<String> {
                 "notes": notes,
             }))?)
         }
-        other => bail!("unknown mode {other:?}; expected \"paste\" or \"keys\""),
+        _ => unreachable!("mode was validated above"),
     }
 }
 
@@ -2255,6 +2265,15 @@ fn optional_i32_arg(args: &Value, key: &str) -> Result<Option<i32>> {
             })?))
         }
     }
+}
+
+fn scroll_delta(args: &Value) -> Result<(i32, i32)> {
+    let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
+    let dy = optional_i32_arg(args, "dy")?.unwrap_or(0);
+    if dx == 0 && dy == 0 {
+        bail!("scroll needs a non-zero dx or dy");
+    }
+    Ok((dx, dy))
 }
 
 fn value_kind(value: &Value) -> &'static str {
@@ -2579,6 +2598,37 @@ mod tests {
 
         assert!(reject_unknown_args("click", &json!({"x": 1, "y": 2, "output": 0})).is_ok());
         assert!(reject_unknown_args("applets", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn tool_argument_allowlists_match_the_advertised_schemas() {
+        for tool in tool_definitions().unwrap() {
+            let name = tool.name.as_ref();
+            let allowed = allowed_tool_args(name)
+                .unwrap_or_else(|| panic!("{name} has no argument allowlist"));
+            let mut advertised: Vec<_> = tool.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            advertised.sort();
+            let mut allowed = allowed.to_vec();
+            allowed.sort();
+            assert_eq!(allowed, advertised, "{name}");
+        }
+    }
+
+    #[test]
+    fn zero_scroll_and_invalid_empty_text_mode_are_rejected() {
+        assert!(scroll_delta(&json!({})).is_err());
+        assert!(scroll_delta(&json!({"dx": 0, "dy": 0})).is_err());
+        assert_eq!(scroll_delta(&json!({"dy": -1})).unwrap(), (0, -1));
+
+        let err = tool_type_text(&json!({"text": "", "mode": "invalid"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown mode"), "{err}");
     }
 
     #[test]

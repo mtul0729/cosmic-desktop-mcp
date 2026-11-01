@@ -760,6 +760,9 @@ fn connect(with_manager: bool) -> Result<Snapshot> {
 /// picking the first of several identical terminals is how clicks land in the
 /// wrong place.
 pub fn find(windows: &[Window], needle: &str) -> Result<Window> {
+    if needle.is_empty() {
+        bail!("window selector must not be empty");
+    }
     if let Some(found) = windows.iter().find(|w| w.identifier == needle) {
         return Ok(found.clone());
     }
@@ -773,9 +776,10 @@ pub fn find(windows: &[Window], needle: &str) -> Result<Window> {
         }
     }
 
+    let wanted = needle.to_lowercase();
     let by_title: Vec<&Window> = windows
         .iter()
-        .filter(|w| w.title.eq_ignore_ascii_case(needle))
+        .filter(|w| w.title.to_lowercase() == wanted)
         .collect();
     match by_title.len() {
         1 => return Ok(by_title[0].clone()),
@@ -785,7 +789,7 @@ pub fn find(windows: &[Window], needle: &str) -> Result<Window> {
 
     let partial: Vec<&Window> = windows
         .iter()
-        .filter(|w| w.title.contains(needle))
+        .filter(|w| w.title.to_lowercase().contains(&wanted))
         .collect();
     match partial.len() {
         1 => Ok(partial[0].clone()),
@@ -866,5 +870,26 @@ mod tests {
         upsert_geometry(&mut reported, 7, moved);
 
         assert_eq!(reported, vec![(7, moved)]);
+    }
+
+    #[test]
+    fn title_substrings_are_case_insensitive_but_still_unique() {
+        let windows = vec![
+            window("one", "app", "Project Notes"),
+            window("two", "app", "Terminal"),
+        ];
+
+        assert_eq!(find(&windows, "notes").unwrap().identifier, "one");
+
+        let duplicate = vec![
+            window("one", "app", "Project Notes"),
+            window("two", "app", "Release Notes"),
+        ];
+        assert!(find(&duplicate, "NOTES").is_err());
+    }
+
+    #[test]
+    fn empty_window_selectors_are_rejected() {
+        assert!(find(&[], "").is_err());
     }
 }

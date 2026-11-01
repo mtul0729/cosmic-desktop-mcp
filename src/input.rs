@@ -101,6 +101,7 @@ fn set_button(button: Button, pressed: bool) -> Result<()> {
 }
 
 /// An EIS region and how it was tied to a `wl_output`.
+#[derive(Debug)]
 pub struct RegionMatch {
     pub region: eis::Region,
     /// `"name"` when `wl_output.name` met the region's `mapping_id`, `"size"`
@@ -117,15 +118,25 @@ pub struct RegionMatch {
 /// same-sized regions, which made `output: 1` clicks land silently on output 0
 /// with two identical monitors.
 pub fn region_for(out: &capture::OutputInfo, regions: &[eis::Region]) -> Result<RegionMatch> {
-    if let Some(name) = out.name.as_deref()
-        && let Some(region) = regions
+    if let Some(name) = out.name.as_deref() {
+        let named: Vec<&eis::Region> = regions
             .iter()
-            .find(|region| region.mapping_id.as_deref() == Some(name))
-    {
-        return Ok(RegionMatch {
-            region: region.clone(),
-            by: "name",
-        });
+            .filter(|region| region.mapping_id.as_deref() == Some(name))
+            .collect();
+        match named.len() {
+            1 => {
+                return Ok(RegionMatch {
+                    region: named[0].clone(),
+                    by: "name",
+                });
+            }
+            0 => {}
+            count => bail!(
+                "output #{} ({name}) matches {count} EIS regions with the same connector name; \
+                 cannot tell them apart",
+                out.index
+            ),
+        }
     }
 
     let same_size: Vec<&eis::Region> = regions
@@ -224,5 +235,18 @@ mod tests {
         let matched = region_for(&output(None, 2560, 1440), &regions).unwrap();
         assert_eq!(matched.by, "size");
         assert_eq!(matched.region.mapping_id.as_deref(), Some("DP-2"));
+    }
+
+    #[test]
+    fn duplicate_connector_names_are_an_error_not_the_first_match() {
+        let regions = vec![
+            region("DP-2", 1920, 1080, 1.0),
+            region("DP-2", 1920, 1080, 1.0),
+        ];
+
+        let err = region_for(&output(Some("DP-2"), 1920, 1080), &regions)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 EIS regions"), "{err}");
     }
 }

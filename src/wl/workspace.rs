@@ -230,6 +230,9 @@ pub fn activate(target: &str, group: Option<usize>) -> Result<Vec<Workspace>> {
     let (_conn, mut queue, manager, mut state) = connect()?;
 
     let wanted = target.trim();
+    if wanted.is_empty() {
+        bail!("workspace selector must not be empty");
+    }
     let matches = |workspace: &Workspace| {
         workspace.name.as_deref() == Some(wanted)
             || coordinates_key(&workspace.coordinates) == wanted

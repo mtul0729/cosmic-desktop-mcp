@@ -189,6 +189,8 @@ Moves the pointer without clicking. Useful for hover state and as a non-clicking
 | `dy` | integer | `0` | Vertical wheel detents; positive is up |
 | `dx` | integer | `0` | Horizontal wheel detents; positive is right |
 
+At least one of `dx` and `dy` must be non-zero.
+
 Positive `dy` follows the kernel `REL_WHEEL` convention and reveals earlier content.
 Negative `dy` scrolls down. Testing downward scroll at the bottom of a list proves nothing;
 start near the top when checking whether scrolling works.
@@ -223,8 +225,8 @@ point in the window image.
 | `dy` | integer | `0` | Vertical wheel detents; positive is up |
 | `dx` | integer | `0` | Horizontal wheel detents; positive is right |
 
-Scrolls at a point in the window image. Uses the same freshness and coordinate validation
-as `click_window`.
+Scrolls at a point in the window image. At least one of `dx` and `dy` must be non-zero.
+Uses the same freshness and coordinate validation as `click_window`.
 
 ## Keyboard
 
