@@ -1725,6 +1725,9 @@ fn window_coordinates_arg(args: &Value) -> Result<WindowCoordinates> {
     if capture == WindowCaptureSpace::OutputCrop && origin.is_none() {
         bail!("coordinates.origin is required for capture=\"output_crop\"");
     }
+    if capture == WindowCaptureSpace::Window && origin.is_some() {
+        bail!("coordinates.origin must be null for capture=\"window\"");
+    }
     Ok(WindowCoordinates {
         window,
         capture,
@@ -2814,6 +2817,27 @@ mod tests {
         assert!(
             incomplete_origin.contains("origin.y is missing"),
             "{incomplete_origin}"
+        );
+
+        let unexpected_origin = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "window",
+                "image": {"width": 1280, "height": 720},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
+                "origin": {"x": 15, "y": 30}
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unexpected_origin.contains("origin must be null"),
+            "{unexpected_origin}"
         );
 
         let bad_capture = window_coordinates_arg(&json!({
