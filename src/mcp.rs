@@ -31,6 +31,9 @@ use crate::wl;
 use crate::wl::toplevel::{self, Rect, Window};
 use crate::wl::{capture, workspace};
 
+const INPUT_VERIFICATION_NOTE: &str = "EIS accepted the input request, but the compositor does not \
+acknowledge delivery; take a new screenshot to verify the result.";
+
 pub fn serve() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1470,15 +1473,20 @@ fn tool_window_action(args: &Value) -> Result<String> {
         .get("window")
         .and_then(Value::as_str)
         .context("window_action needs \"window\" (identifier, app_id or title)")?;
-    let action = toplevel::Action::parse(
-        args.get("action")
-            .and_then(Value::as_str)
-            .context("window_action needs \"action\"")?,
-    )?;
+    let action_name = args
+        .get("action")
+        .and_then(Value::as_str)
+        .context("window_action needs \"action\"")?;
+    let action = toplevel::Action::parse(action_name)?;
     let done = toplevel::act(needle, action)?;
-    Ok(format!(
-        "{done}\nthe compositor may ignore a request; re-run list_windows to see the resulting state"
-    ))
+    Ok(serde_json::to_string_pretty(&json!({
+        "action": "window_action",
+        "requested": action_name,
+        "window": needle,
+        "summary": done,
+        "verified": false,
+        "note": "the compositor may ignore this request; re-run list_windows to see the resulting state",
+    }))?)
 }
 
 fn button_arg(args: &Value) -> Result<Button> {
@@ -1710,7 +1718,8 @@ fn tool_click(args: &Value) -> Result<String> {
     };
 
     input::click_logical(button, lx, ly, count)?;
-    let (locked, lock_evidence, notes) = lock_notes();
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
 
     Ok(serde_json::to_string_pretty(&json!({
         "summary": format!("clicked {button:?} at ({x}, {y}) on output {output} x{count}"),
@@ -1724,6 +1733,7 @@ fn tool_click(args: &Value) -> Result<String> {
         "other_output_match": other,
         "screen_locked": locked,
         "lock_evidence": lock_evidence,
+        "verified": false,
         "notes": notes,
     }))?)
 }
@@ -1749,7 +1759,8 @@ fn tool_move(args: &Value) -> Result<String> {
     };
 
     input::move_logical(lx, ly)?;
-    let (locked, lock_evidence, notes) = lock_notes();
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
 
     Ok(serde_json::to_string_pretty(&json!({
         "summary": format!("pointer at ({x}, {y}) on output {output}"),
@@ -1761,6 +1772,7 @@ fn tool_move(args: &Value) -> Result<String> {
         "other_output_match": other,
         "screen_locked": locked,
         "lock_evidence": lock_evidence,
+        "verified": false,
         "notes": notes,
     }))?)
 }
@@ -1788,7 +1800,8 @@ fn tool_scroll(args: &Value) -> Result<String> {
     };
 
     input::scroll_logical(lx, ly, dx, dy)?;
-    let (locked, lock_evidence, notes) = lock_notes();
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
 
     Ok(serde_json::to_string_pretty(&json!({
         "summary": format!("scrolled dx={dx} dy={dy} at ({x}, {y}) on output {output}"),
@@ -1802,6 +1815,7 @@ fn tool_scroll(args: &Value) -> Result<String> {
         "other_output_match": other,
         "screen_locked": locked,
         "lock_evidence": lock_evidence,
+        "verified": false,
         "notes": notes,
     }))?)
 }
@@ -1831,6 +1845,7 @@ fn tool_click_window(args: &Value) -> Result<String> {
     let hit = scene.hit(geometry.output_index, ox, oy);
     let (locked, lock_evidence, mut notes) = lock_notes();
     notes.extend(pointer_notes(window, &geometry));
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
 
     input::click_logical(button, lx, ly, count)?;
 
@@ -1865,6 +1880,7 @@ fn tool_click_window(args: &Value) -> Result<String> {
         "workspaces": window.workspaces,
         "screen_locked": locked,
         "lock_evidence": lock_evidence,
+        "verified": false,
         "notes": notes,
     }))?)
 }
@@ -1892,6 +1908,7 @@ fn tool_move_window(args: &Value) -> Result<String> {
     let hit = scene.hit(geometry.output_index, ox, oy);
     let (locked, lock_evidence, mut notes) = lock_notes();
     notes.extend(pointer_notes(window, &geometry));
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
 
     input::move_logical(lx, ly)?;
 
@@ -1924,6 +1941,7 @@ fn tool_move_window(args: &Value) -> Result<String> {
         "workspaces": window.workspaces,
         "screen_locked": locked,
         "lock_evidence": lock_evidence,
+        "verified": false,
         "notes": notes,
     }))?)
 }
@@ -1953,6 +1971,7 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
     let hit = scene.hit(geometry.output_index, ox, oy);
     let (locked, lock_evidence, mut notes) = lock_notes();
     notes.extend(pointer_notes(window, &geometry));
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
 
     input::scroll_logical(lx, ly, dx, dy)?;
 
@@ -1987,6 +2006,7 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
         "workspaces": window.workspaces,
         "screen_locked": locked,
         "lock_evidence": lock_evidence,
+        "verified": false,
         "notes": notes,
     }))?)
 }
@@ -1997,10 +2017,20 @@ fn tool_type_text(args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .context("missing text")?;
     if text.is_empty() {
-        return Ok("nothing to type".to_string());
+        let (locked, lock_evidence, notes) = lock_notes();
+        return Ok(serde_json::to_string_pretty(&json!({
+            "action": "type_text",
+            "characters": 0,
+            "screen_locked": locked,
+            "lock_evidence": lock_evidence,
+            "verified": true,
+            "notes": notes,
+        }))?);
     }
 
     let mode = optional_string_arg(args, "mode")?.unwrap_or("paste");
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
     match mode {
         // Keycodes go through the compositor's input pipeline, which hands
         // them to whatever input method is active. With fcitx5 running, "abc"
@@ -2016,21 +2046,35 @@ fn tool_type_text(args: &Value) -> Result<String> {
                 bail!("mode=keys only accepts printable ASCII; use mode=paste for anything else");
             }
             input::type_keys(text)?;
-            Ok(format!(
-                "typed {} characters as keycodes",
-                text.chars().count()
-            ))
+            Ok(serde_json::to_string_pretty(&json!({
+                "action": "type_text",
+                "mode": "keys",
+                "characters": text.chars().count(),
+                "clipboard_overwritten": false,
+                "screen_locked": locked,
+                "lock_evidence": lock_evidence,
+                "verified": false,
+                "notes": notes,
+            }))?)
         }
         "paste" => {
             clipboard::write(text)?;
             // The compositor needs to see the new selection before the paste
             // request, otherwise the target reads the previous contents.
             std::thread::sleep(Duration::from_millis(120));
-            press_chord("ctrl+v")?;
-            Ok(format!(
-                "pasted {} characters via the clipboard (ctrl+v); the clipboard now holds this text",
-                text.chars().count()
-            ))
+            press_chord("ctrl+v")
+                .context("the clipboard was overwritten, but the ctrl+v input request failed")?;
+            notes.push("the clipboard now holds this text".to_string());
+            Ok(serde_json::to_string_pretty(&json!({
+                "action": "type_text",
+                "mode": "paste",
+                "characters": text.chars().count(),
+                "clipboard_overwritten": true,
+                "screen_locked": locked,
+                "lock_evidence": lock_evidence,
+                "verified": false,
+                "notes": notes,
+            }))?)
         }
         other => bail!("unknown mode {other:?}; expected \"paste\" or \"keys\""),
     }
@@ -2057,8 +2101,17 @@ fn tool_key(args: &Value) -> Result<String> {
         .get("combo")
         .and_then(Value::as_str)
         .context("missing combo")?;
+    let (locked, lock_evidence, mut notes) = lock_notes();
+    notes.push(INPUT_VERIFICATION_NOTE.to_string());
     press_chord(combo)?;
-    Ok(format!("pressed {combo}"))
+    Ok(serde_json::to_string_pretty(&json!({
+        "action": "key",
+        "combo": combo,
+        "screen_locked": locked,
+        "lock_evidence": lock_evidence,
+        "verified": false,
+        "notes": notes,
+    }))?)
 }
 
 fn press_chord(combo: &str) -> Result<()> {
