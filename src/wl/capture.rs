@@ -70,9 +70,8 @@ pub struct OutputInfo {
 #[derive(Default)]
 struct State {
     outputs: Vec<OutputInfo>,
-    pending_mode: Option<(i32, i32)>,
-    pending_scale: Option<i32>,
-    pending_name: Option<String>,
+    output_ids: Vec<ObjectId>,
+    pending_outputs: HashMap<ObjectId, PendingOutput>,
 
     foreign_handles: HashMap<ObjectId, ExtForeignToplevelHandleV1>,
     foreign_identifiers: HashMap<ObjectId, String>,
@@ -83,6 +82,13 @@ struct State {
     frame_ready: bool,
     frame_failed: Option<u32>,
     log: Vec<&'static str>,
+}
+
+#[derive(Default)]
+struct PendingOutput {
+    mode: Option<(i32, i32)>,
+    scale: Option<i32>,
+    name: Option<String>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -100,7 +106,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
 impl Dispatch<wl_output::WlOutput, ()> for State {
     fn event(
         state: &mut Self,
-        _proxy: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
         event: wl_output::Event,
         _data: &(),
         _conn: &Connection,
@@ -117,22 +123,30 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
                     .into_result()
                     .map(|f| f.contains(wl_output::Mode::Current))
                     .unwrap_or(false);
-                if current || state.pending_mode.is_none() {
-                    state.pending_mode = Some((width, height));
+                let pending = state.pending_outputs.entry(output.id()).or_default();
+                if current || pending.mode.is_none() {
+                    pending.mode = Some((width, height));
                 }
             }
-            wl_output::Event::Scale { factor } => state.pending_scale = Some(factor),
-            wl_output::Event::Name { name } => state.pending_name = Some(name),
+            wl_output::Event::Scale { factor } => {
+                state.pending_outputs.entry(output.id()).or_default().scale = Some(factor);
+            }
+            wl_output::Event::Name { name } => {
+                state.pending_outputs.entry(output.id()).or_default().name = Some(name);
+            }
             wl_output::Event::Done => {
-                if let Some((width, height)) = state.pending_mode.take() {
+                if let Some(pending) = state.pending_outputs.remove(&output.id())
+                    && let Some((width, height)) = pending.mode
+                {
                     let index = state.outputs.len();
                     state.outputs.push(OutputInfo {
                         index,
-                        name: state.pending_name.take(),
+                        name: pending.name,
                         width,
                         height,
-                        scale: state.pending_scale.take().unwrap_or(1),
+                        scale: pending.scale.unwrap_or(1),
                     });
+                    state.output_ids.push(output.id());
                 }
             }
             _ => {}
@@ -386,9 +400,14 @@ pub fn capture(output_index: usize) -> Result<Shot> {
             )
         })?
         .clone();
-    let output = output_proxies
+    let output_id = state
+        .output_ids
         .get(output_index)
-        .context("output proxy index out of range")?
+        .context("output id index out of range")?;
+    let output = output_proxies
+        .iter()
+        .find(|proxy| proxy.id() == *output_id)
+        .context("output proxy not found for captured output")?
         .clone();
 
     let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
