@@ -337,8 +337,8 @@ flake: `nix run github:mtul0729/cosmic-desktop-mcp`.
    while the `output_crop` fallback returns whatever pixels are actually in that area.
    `capture.source` says which happened. `list_windows` now reports
    `on_active_workspace` (and the workspace group/name) so the second case is visible
-   before you click, and `click_window` warns when the target is not on the active
-   workspace. For the first case, `window_action activate` first. Stacking order is not
+   before you click, and window pointer tools reject targets that are minimized or not on
+   the active workspace. For the first case, `window_action activate` first. Stacking order is not
    exposed, so a hit test with several overlapping candidates says it is ambiguous instead
    of picking one.
 4. **`key`'s key table assumes a US layout.** Events enter the compositor's input pipeline

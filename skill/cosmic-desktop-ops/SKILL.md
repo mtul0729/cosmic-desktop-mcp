@@ -177,10 +177,10 @@ keystrokes does.**
   **`activate` first when the image and what a click will hit must agree.**
 - **Workspace membership is reported.** `workspaces` lists the group, name and
   `active` flag; `on_active_workspace` is the short answer. When it is `false`,
-  the window's geometry describes a workspace the output is not showing, so a
-  click there hits whatever is visible instead — `click_window` warns about
-  this, but check before trusting a screenshot. `null` means the compositor did
-  not expose membership, not that the window is on nothing.
+  the window's geometry describes a workspace the output is not showing.
+  Window pointer tools reject this case instead of clicking whatever is
+  visible; switch workspaces or activate the target first. `null` means the
+  compositor did not expose membership, not that the window is on nothing.
 - **The first enumeration may take ~600 ms before geometry appears.** The
   compositor pushes the initial state from its frame-commit path, so an idle
   desktop waits for the next frame. That is by design, not a hang.

@@ -232,6 +232,10 @@ fallback). The containing directory is created with mode `0700` and the token wi
 `0600`; permission or storage failures are reported in the input-session detail. It can
 authorize input injection, so treat it as a secret and never commit it.
 
+Screenshots are written below `$XDG_RUNTIME_DIR/cosmic-desktop-mcp/` with a `0700` directory
+and `0600` files. If the user runtime directory cannot be resolved, screenshot tools fail
+instead of falling back to shared `/tmp`.
+
 MCP is an interface, not a sandbox. Restricting a client to this server does not make
 desktop control safe or least-privilege.
 

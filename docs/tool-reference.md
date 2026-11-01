@@ -79,7 +79,8 @@ you want to trigger and diagnose authorization before taking an action.
 Captures one output without opening an input session. Returns the PNG path, image size,
 output metadata, and `screen_locked` (`null` when logind cannot answer). The image is at
 the output's full screenshot resolution. It is the pixel space accepted by `click`, `move`
-and `scroll` with the same `output`.
+and `scroll` with the same `output`. PNGs are written to a private `0700` directory with
+mode `0600`; screenshot tools fail rather than use a shared temporary directory.
 
 If `screen_locked` is `true`, the image is the lock screen or a blanked desktop, not the
 user's session. Capture can also time out while locked.
@@ -103,7 +104,8 @@ expose membership; `null` means unknown, not "on no workspace".
 
 Geometry is the last reported placement, not visibility. A covered window or a window on an
 inactive workspace can still have geometry. Activate the target before relying on the
-image and click position matching.
+image and click position matching. The window pointer tools reject minimized windows and
+windows whose `on_active_workspace` is `false`.
 
 The first geometry report can take up to about 600 ms on an idle desktop. Re-list if a
 window has no geometry yet.
@@ -148,7 +150,9 @@ without activation `type_text` and `key` go to the previously focused window.
 
 The pointer tools return the output and logical point they used, a hit test for the window
 under the point, and lock state. Read `hit.window`, `hit.ambiguous`,
-`on_active_workspace`, and `other_output_match` when an action appears not to work.
+`on_active_workspace`, and `other_output_match` when an action appears not to work. EIS
+does not acknowledge delivery, so action replies include `verified: false`; take another
+screenshot to confirm the result.
 
 ### `click`
 
@@ -234,6 +238,7 @@ intended for cases where no input method is active or real key events are requir
 fcitx5 in Chinese mode, ASCII can be interpreted as pinyin and turned into candidates.
 
 Text goes to the **currently focused** window. Activate the intended window first.
+The reply includes `screen_locked`, `lock_evidence` and `verified: false`.
 
 ### `key`
 
@@ -242,7 +247,7 @@ Text goes to the **currently focused** window. Activate the intended window firs
 | `combo` | string | yes | Key chord such as `ctrl+s`, `alt+tab` or `Return` |
 
 Sends one chord to the currently focused window. The key table assumes a US layout; use
-`type_text` for text on other layouts.
+`type_text` for text on other layouts. The reply includes lock state and `verified: false`.
 
 ## Workspaces
 

@@ -241,17 +241,14 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "name": "env_info",
             "description": "Report the current desktop topology and whether the input backend is \
     ready. Cheap, side-effect free: it never opens an EIS session, so it cannot raise a portal \
-    authorization dialog. Call it before the first click when you do not know how many outputs \
-    exist, or when a click seems to do nothing and you need to know whether input is authorized.",
+    authorization dialog.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "prepare_input",
             "description": "Open or reuse the EIS input session and report its devices and output \
     regions. This is the only status-like tool with a possible side effect: on first use it may \
-    show the system RemoteDesktop authorization dialog, and a human must approve it. Actual input \
-    tools also open the session on first use, so calling this is optional; use it when you want to \
-    trigger and diagnose authorization before taking an action.",
+    show the system RemoteDesktop authorization dialog, and a human must approve it.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -264,9 +261,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
     until the input session exists, because the logical-to-pixel factor is only trustworthy when it \
     comes from the EIS region. \"workspaces\" lists every workspace the window is on (group, name, \
     active); \"on_active_workspace\" says whether one of them is the one its output currently shows. \
-    Both are null when the compositor did not expose membership. A window on an inactive workspace \
-    still has geometry — its last placement — so clicking those pixels hits whatever is visible \
-    instead.",
+    Both are null when the compositor did not expose membership.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -275,8 +270,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
     compositor's direct window capture source; if that is unavailable or not coordinate-safe, it \
     can use an output crop only when an input session is already open. Returns the PNG path, a \
     \"coordinates\" object, and capture metadata. Pass that coordinates object unchanged to \
-    click_window / move_window / scroll_window. If the response is a needs_input_session error, \
-    call prepare_input explicitly and take a new screenshot; this tool never opens the portal.",
+    click_window / move_window / scroll_window. This tool never opens the portal.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -292,9 +286,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "name": "window_action",
             "description": "Ask the compositor to act on a window: activate, close, maximize, \
     unmaximize, minimize, unminimize, fullscreen, unfullscreen (zcosmic_toplevel_manager_v1). \
-    **Use activate before typing**: an EIS click does not move keyboard focus on COSMIC, so click + \
-    type_text lands in whatever was focused before unless the window is activated first. The \
-    compositor may ignore a request; re-list to confirm the resulting state.",
+    The compositor may ignore a request; this tool reports the request, not a guaranteed result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -314,10 +306,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "name": "click",
             "description": "Click at (x,y) in the screenshot pixel space of the chosen output. \
     The output argument defaults to 0 and is never inferred from x/y, so coordinates taken from \
-    another output's screenshot click the wrong monitor. If the point came from screenshot_window, \
-    use click_window instead. The reply names the output actually used and the window under the \
-    point (null = no window reported there), and warns when the same (x,y) lands inside a window on \
-    a different output.",
+    another output's screenshot click the wrong monitor. The reply names the output actually used \
+    and the window under the point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -344,9 +334,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         {
             "name": "move",
             "description": "Move the pointer without clicking (hover), in the screenshot pixel \
-    space of the chosen output (default 0, never inferred from x/y). For a point taken from \
-    screenshot_window use move_window. The reply reports the output used and the window under the \
-    point.",
+    space of the chosen output (default 0, never inferred from x/y). The reply reports the output \
+    used and the window under the point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -365,8 +354,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "description": "Scroll the wheel at (x,y) in the screenshot pixel space of the chosen \
     output (default 0, never inferred from x/y). Positive dy scrolls UP (reveals earlier content, \
     matching the kernel REL_WHEEL convention), negative dy scrolls down; positive dx scrolls right. \
-    For a point taken from screenshot_window use scroll_window. The reply reports the output used \
-    and the window under the point.",
+    The reply reports the output used and the window under the point.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -387,7 +375,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "description": "Click at (x,y) in the image returned by screenshot_window. Pass that \
     result's \"coordinates\" object unchanged: it identifies the screenshot's capture space, image \
     size and logical window rect. The tool validates freshness, opens/reuses EIS, and resolves the \
-    output pixel and logical point itself. Use this instead of click for anything inside a window.",
+    output pixel and logical point itself.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -470,10 +458,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         {
             "name": "type_text",
             "description": "Type text into the focused window. Default mode \"paste\" puts the text \
-    on the clipboard and presses ctrl+v: this is the reliable path, because synthesized keycodes are \
-    routed through the active input method and ASCII turns into pinyin candidates under fcitx5. Mode \
-    \"keys\" injects keycodes instead (printable ASCII only) and is only correct when no input method \
-    is active or real key events are wanted. Note that paste mode overwrites the clipboard.",
+    on the clipboard and presses ctrl+v; it overwrites the clipboard. Mode \"keys\" injects \
+    printable ASCII keycodes instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -527,11 +513,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         {
             "name": "restart_applet",
             "description": "Restart a panel applet by blanking and rewriting the cosmic-panel \
-    plugins_* config entry that lists it. That is the only thing observed to make the panel respawn an \
-    applet: a plain SIGTERM leaves the slot empty, because cosmic-panel does not supervise its applets \
-    even though it builds a launch-pad ProcessManager. In practice the panel rebuilds every applet on \
-    that section (time, workspaces and audio all get new pids), so treat this as a panel refresh. The \
-    original config text is always written back, and a private backup lands under \
+    plugins_* config entry that lists it. The whole panel section may be rebuilt. The original config \
+    text is always written back, and a private backup lands under \
     $XDG_STATE_HOME/cosmic-desktop-mcp/panel-backups/ (or ~/.local/state/...). Accepts a full name \
     (cosmic-applet-time) or the suffix (time).",
             "inputSchema": {
@@ -562,8 +545,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "name": "config_write",
             "description": "Write or delete one cosmic-config key. The value is RON written \
     verbatim, so strings keep their quotes and enums keep their variant names. Returns the previous \
-    value, which makes the change reversible. COSMIC watches the config tree and most consumers react \
-    immediately; applets that only read at startup need restart_applet afterwards.",
+    value, which makes the change reversible.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

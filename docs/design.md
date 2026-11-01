@@ -47,9 +47,10 @@ report that they are actions and include enough context to verify what happened.
 ### 5. Never quietly guess
 
 Reject ambiguous window selectors, workspace names and output matches. Reject stale window
-coordinates. Return structured errors when authorization is denied, unavailable or timed
-out. A compositor request is not proof that the compositor honoured it, so callers must be
-able to re-read the resulting state.
+coordinates, and reject pointer input aimed at minimized windows or windows on an inactive
+workspace. Return structured errors when authorization is denied, unavailable or timed out.
+A compositor request is not proof that the compositor honoured it, so callers must be able
+to re-read the resulting state.
 
 ### 6. Make side effects visible and reversible
 
@@ -57,6 +58,10 @@ Pointer replies report the output used, logical point, hit test and lock state.
 `config_write` returns the previous value. `restart_applet` restores the original config and
 keeps a backup. Screenshots return their path and dimensions. An action that cannot be
 verified should say so rather than present a success summary as certainty.
+
+Screenshots and secret-bearing state stay private: directories are created as `0700`, files
+as `0600`, and a missing user runtime directory is an error rather than a fallback to shared
+`/tmp`.
 
 ### 7. Keep authorization human-controlled
 
@@ -77,6 +82,10 @@ journalctl --user -b --no-pager -n <lines> -t <name>
 ```
 
 The operations skill now gives that recipe directly.
+
+The same rule removed `clipboard_read` and `clipboard_write`. `type_text` keeps an internal
+clipboard writer because paste is part of its COSMIC input behaviour, not a second generic
+clipboard API.
 
 ### 9. Measure against a real COSMIC session
 
