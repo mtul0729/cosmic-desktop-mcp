@@ -111,6 +111,11 @@ pub enum Action {
     Unfullscreen,
 }
 
+pub struct ActionOutcome {
+    pub window: Window,
+    pub summary: String,
+}
+
 impl Action {
     pub fn parse(name: &str) -> Result<Self> {
         Ok(match name {
@@ -603,7 +608,7 @@ impl Snapshot {
 
     /// Asks the compositor to act on a window. Returns a human-readable line
     /// describing what was requested, since the compositor may ignore it.
-    pub fn act(&mut self, needle: &str, action: Action) -> Result<String> {
+    pub fn act(&mut self, needle: &str, action: Action) -> Result<ActionOutcome> {
         let target = self.find(needle)?;
         let manager = self
             .manager
@@ -648,12 +653,10 @@ impl Snapshot {
             .roundtrip(&mut self.state)
             .context("roundtrip after window action")?;
 
-        Ok(format!(
-            "{} {:?} ({})",
-            action.as_str(),
-            target.title,
-            target.app_id
-        ))
+        Ok(ActionOutcome {
+            summary: format!("{} {:?} ({})", action.as_str(), target.title, target.app_id),
+            window: target,
+        })
     }
 }
 
@@ -803,7 +806,7 @@ pub fn list() -> Result<Vec<Window>> {
 }
 
 /// Performs `action` on the window matching `needle`.
-pub fn act(needle: &str, action: Action) -> Result<String> {
+pub fn act(needle: &str, action: Action) -> Result<ActionOutcome> {
     connect(true)?.act(needle, action)
 }
 

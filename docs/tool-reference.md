@@ -144,7 +144,8 @@ window screenshot.
 | `action` | string | yes | `activate`, `close`, `maximize`, `unmaximize`, `minimize`, `unminimize`, `fullscreen` or `unfullscreen` |
 
 Sends a request to the compositor. It does not wait for or guarantee the requested state.
-Re-run `list_windows` to confirm the result.
+The reply names the resolved window and its identifier, even when the selector was an
+`app_id` or title. Re-run `list_windows` to confirm the result.
 
 **Use `activate` before typing.** An EIS click does not move keyboard focus on COSMIC, so
 without activation `type_text` and `key` go to the previously focused window.

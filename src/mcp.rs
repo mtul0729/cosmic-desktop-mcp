@@ -1510,8 +1510,9 @@ fn tool_window_action(args: &Value) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json!({
         "action": "window_action",
         "requested": action_name,
-        "window": needle,
-        "summary": done,
+        "selector": needle,
+        "window": window_ref(&done.window),
+        "summary": done.summary,
         "verified": false,
         "note": "the compositor may ignore this request; re-run list_windows to see the resulting state",
     }))?)
