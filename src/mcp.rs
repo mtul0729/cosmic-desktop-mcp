@@ -507,8 +507,9 @@ fn tool_definitions() -> Result<Vec<Tool>> {
         {
             "name": "applets",
             "description": "List running COSMIC panel applets as processes: name, pid, parent, \
-    memory and age. cosmic-panel starts the applets but does not reliably respawn one that exits, \
-    so there is normally one instance per panel (two monitors = two copies of each applet).",
+    memory and age. Parent, memory and age are null when /proc does not expose them. cosmic-panel \
+    starts the applets but does not reliably respawn one that exits, so there is normally one \
+    instance per panel (two monitors = two copies of each applet).",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {

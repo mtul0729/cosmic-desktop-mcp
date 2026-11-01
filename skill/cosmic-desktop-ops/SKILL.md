@@ -218,7 +218,8 @@ to automate your way out.
 
 `applets` lists every applet from `/proc`: name (taken from `argv[0]`, **not**
 `/proc/<pid>/comm`, which is always `.cosmic-applets`), PID, parent, RSS, age.
-Two panels means two copies of each applet.
+Two panels means two copies of each applet. Parent, RSS and age are `null` when
+`/proc` does not expose them; do not read that as zero.
 
 **Never restart an applet with `kill` or SIGTERM.** cosmic-panel's source builds a
 `ProcessManager` with exponential backoff, but in practice a SIGTERM leaves the

@@ -276,8 +276,9 @@ explicitly; the tool will not guess.
 
 ### `applets`
 
-Lists running panel applets from `/proc`: process name, PID, parent, memory and age. One
-panel per output generally means one copy of each applet per output. No arguments.
+Lists running panel applets from `/proc`: process name, PID, parent, memory and age. Parent,
+memory and age are `null` when `/proc` does not expose them. One panel per output generally
+means one copy of each applet per output. No arguments.
 
 ### `restart_applet`
 

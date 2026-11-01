@@ -39,11 +39,11 @@ pub struct Applet {
     pub name: String,
     /// Remaining arguments; panel buttons carry their app id here.
     pub args: Vec<String>,
-    pub ppid: u32,
-    pub parent: String,
-    pub rss_kb: u64,
+    pub ppid: Option<u32>,
+    pub parent: Option<String>,
+    pub rss_kb: Option<u64>,
     /// Seconds since the process started.
-    pub age_s: u64,
+    pub age_s: Option<u64>,
 }
 
 pub fn list() -> Result<Vec<Applet>> {
@@ -83,23 +83,25 @@ fn read_applet(pid: u32) -> Option<Applet> {
         return None;
     }
 
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    let ppid = field(&status, "PPid:")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let rss_kb = field(&status, "VmRSS:")
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok();
+    let ppid = status
+        .as_deref()
+        .and_then(|status| field(status, "PPid:"))
+        .and_then(|value| value.parse().ok());
+    let rss_kb = status
+        .as_deref()
+        .and_then(|status| field(status, "VmRSS:"))
         .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
+        .and_then(|value| value.parse().ok());
 
     Some(Applet {
         pid,
         name,
         args: argv,
         ppid,
-        parent: process_name(ppid),
+        parent: ppid.and_then(process_name),
         rss_kb,
-        age_s: age_seconds(pid).unwrap_or(0),
+        age_s: age_seconds(pid),
     })
 }
 
@@ -116,11 +118,11 @@ fn field<'a>(status: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|line| line.strip_prefix(key).map(str::trim))
 }
 
-fn process_name(pid: u32) -> String {
+fn process_name(pid: u32) -> Option<String> {
     if pid == 0 {
-        return String::new();
+        return None;
     }
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let first = cmdline
         .split(|byte| *byte == 0)
         .next()
@@ -129,9 +131,10 @@ fn process_name(pid: u32) -> String {
     if first.is_empty() {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .map(|comm| comm.trim().to_string())
-            .unwrap_or_default()
+            .ok()
+            .filter(|comm| !comm.is_empty())
     } else {
-        basename(&first)
+        Some(basename(&first))
     }
 }
 
