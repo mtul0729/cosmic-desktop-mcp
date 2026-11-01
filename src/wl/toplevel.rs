@@ -433,8 +433,11 @@ impl Dispatch<ZcosmicToplevelHandleV1, ()> for State {
                 height,
             } => {
                 // A window can be visible on several outputs and reports one
-                // geometry per output. Keep them all; the caller picks.
-                state.geometry.entry(id.clone()).or_default().push((
+                // geometry per output. Replace the entry for that output:
+                // repeated events describe the same placement changing, not
+                // additional windows.
+                upsert_geometry(
+                    state.geometry.entry(id.clone()).or_default(),
                     output.id(),
                     Rect {
                         x,
@@ -442,7 +445,7 @@ impl Dispatch<ZcosmicToplevelHandleV1, ()> for State {
                         width,
                         height,
                     },
-                ));
+                );
             }
             // v3 replaced the zcosmic_workspace_* events with the standard
             // workspace objects, which is what the workspace manager can name.
@@ -758,8 +761,12 @@ pub fn find(windows: &[Window], needle: &str) -> Result<Window> {
     }
 
     let by_app: Vec<&Window> = windows.iter().filter(|w| w.app_id == needle).collect();
-    if by_app.len() == 1 {
-        return Ok(by_app[0].clone());
+    match by_app.len() {
+        0 => {}
+        1 => return Ok(by_app[0].clone()),
+        count => {
+            bail!("{needle:?} matches {count} windows by app_id; use the identifier instead")
+        }
     }
 
     let by_title: Vec<&Window> = windows
@@ -798,4 +805,62 @@ pub fn list() -> Result<Vec<Window>> {
 /// Performs `action` on the window matching `needle`.
 pub fn act(needle: &str, action: Action) -> Result<String> {
     connect(true)?.act(needle, action)
+}
+
+fn upsert_geometry<K: PartialEq>(reported: &mut Vec<(K, Rect)>, output: K, rect: Rect) {
+    if let Some((_, existing)) = reported
+        .iter_mut()
+        .find(|(candidate, _)| *candidate == output)
+    {
+        *existing = rect;
+    } else {
+        reported.push((output, rect));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(identifier: &str, app_id: &str, title: &str) -> Window {
+        Window {
+            identifier: identifier.to_string(),
+            app_id: app_id.to_string(),
+            title: title.to_string(),
+            ..Window::default()
+        }
+    }
+
+    #[test]
+    fn ambiguous_app_ids_do_not_fall_through_to_titles() {
+        let windows = vec![
+            window("one", "kitty", "kitty"),
+            window("two", "kitty", "notes"),
+        ];
+
+        let err = find(&windows, "kitty").unwrap_err().to_string();
+
+        assert!(err.contains("2 windows by app_id"), "{err}");
+    }
+
+    #[test]
+    fn repeated_geometry_replaces_the_same_output() {
+        let first = Rect {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        };
+        let moved = Rect {
+            x: 50,
+            y: 60,
+            width: 640,
+            height: 480,
+        };
+        let mut reported = vec![(7u32, first)];
+
+        upsert_geometry(&mut reported, 7, moved);
+
+        assert_eq!(reported, vec![(7, moved)]);
+    }
 }
