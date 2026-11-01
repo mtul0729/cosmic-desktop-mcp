@@ -326,9 +326,10 @@ file.
 | `value` | string | omitted | Raw RON text; omit or pass `null` to delete |
 
 Writes the value verbatim, so strings keep their quotes and enums keep their variant names.
-The response includes the previous value; keep it for rollback. Most COSMIC consumers
-watch the config tree, but an applet that reads only at startup may need
-`restart_applet`. A non-string, non-null `value` is rejected rather than treated as a
+The response includes the exact previous file text, including whitespace, so it can be
+written back unchanged for rollback. `config_read` likewise returns the file text verbatim.
+Most COSMIC consumers watch the config tree, but an applet that reads only at startup may
+need `restart_applet`. A non-string, non-null `value` is rejected rather than treated as a
 deletion.
 
 ## Related documentation

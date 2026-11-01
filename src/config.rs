@@ -82,7 +82,7 @@ pub fn read(app: Option<&str>, key: Option<&str>) -> Result<Value> {
                 Ok(raw) => Ok(json!({
                     "app": app,
                     "key": key,
-                    "value": raw.trim(),
+                    "value": raw,
                     "path": path.display().to_string(),
                 })),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -115,7 +115,7 @@ fn read_entries(dir: &Path) -> Result<Vec<Value>> {
         let key = entry.file_name().to_string_lossy().into_owned();
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("read config value {}", path.display()))?;
-        keys.push(json!({"key": key, "value": raw.trim()}));
+        keys.push(json!({"key": key, "value": raw}));
     }
     keys.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
     Ok(keys)
@@ -168,7 +168,7 @@ pub fn write(app: &str, key: &str, value: Option<&str>) -> Result<Value> {
                 "app": app,
                 "key": key,
                 "written": raw,
-                "previous": before.map(|text| text.trim().to_string()),
+                "previous": before,
                 "path": path.display().to_string(),
             }))
         }
@@ -181,7 +181,7 @@ pub fn write(app: &str, key: &str, value: Option<&str>) -> Result<Value> {
                 "app": app,
                 "key": key,
                 "deleted": true,
-                "previous": before.map(|text| text.trim().to_string()),
+                "previous": before,
                 "path": path.display().to_string(),
             }))
         }
@@ -262,6 +262,16 @@ mod tests {
         let err = read_entries(&temp.0).unwrap_err().to_string();
 
         assert!(err.contains("broken"), "{err}");
+    }
+
+    #[test]
+    fn config_values_keep_their_exact_text_for_rollback() {
+        let temp = TempDir::new();
+        std::fs::write(temp.0.join("setting"), "true\n").unwrap();
+
+        let entries = read_entries(&temp.0).unwrap();
+
+        assert_eq!(entries[0]["value"], "true\n");
     }
 
     #[test]
