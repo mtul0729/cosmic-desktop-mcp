@@ -218,6 +218,7 @@ lazily, so an authorization dialog can appear on first use.
 | Click does nothing | Read `hit`, `on_active_workspace`, and `other_output_match` in the response |
 | Text goes to the wrong window | Activate the intended window immediately before typing |
 | `screenshot_window` returns `needs_input_session` | Run `prepare_input`, approve the dialog, then take a new window screenshot |
+| `screenshot_window` returns `no_usable_geometry` | Run `env_info` and inspect the output's EIS region; authorization is already open |
 | Screenshot times out or looks like a greeter | Check whether the session is locked |
 | A window screenshot shows different pixels from direct capture | Check `capture.source`; activate first if the image and click must match |
 

@@ -354,9 +354,12 @@ fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
     let qh = queue.handle();
 
     let registry = globals.registry().clone();
+    let mut output_proxies = Vec::new();
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" {
-            let _: wl_output::WlOutput = registry.bind(global.name, global.version.min(4), &qh, ());
+            let proxy: wl_output::WlOutput =
+                registry.bind(global.name, global.version.min(4), &qh, ());
+            output_proxies.push(proxy);
         }
     }
 
@@ -364,6 +367,7 @@ fn connect() -> Result<(Connection, wayland_client::EventQueue<State>, State)> {
     queue
         .roundtrip(&mut state)
         .context("roundtrip for outputs")?;
+    sort_outputs_by_registry_order(&mut state, &output_proxies);
     Ok((conn, queue, state))
 }
 
@@ -386,6 +390,7 @@ pub fn capture(output_index: usize) -> Result<Shot> {
     queue
         .roundtrip(&mut state)
         .context("roundtrip for outputs")?;
+    sort_outputs_by_registry_order(&mut state, &output_proxies);
 
     if state.outputs.is_empty() {
         bail!("compositor advertised no wl_output");
@@ -422,6 +427,25 @@ pub fn capture(output_index: usize) -> Result<Shot> {
         rgba: frame.rgba,
         output: target,
     })
+}
+
+fn sort_outputs_by_registry_order(state: &mut State, proxies: &[wl_output::WlOutput]) {
+    let order: HashMap<ObjectId, usize> = proxies
+        .iter()
+        .enumerate()
+        .map(|(index, proxy)| (proxy.id(), index))
+        .collect();
+    let mut outputs: Vec<_> = state
+        .outputs
+        .drain(..)
+        .zip(state.output_ids.drain(..))
+        .collect();
+    outputs.sort_by_key(|(_, id)| order.get(id).copied().unwrap_or(usize::MAX));
+    for (index, (mut output, id)) in outputs.into_iter().enumerate() {
+        output.index = index;
+        state.outputs.push(output);
+        state.output_ids.push(id);
+    }
 }
 
 /// Captures a foreign toplevel directly, without first copying its output.

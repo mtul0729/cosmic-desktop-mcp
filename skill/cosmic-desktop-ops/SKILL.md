@@ -284,6 +284,7 @@ raw RON.
 | Text lands in the wrong window | `window_action activate` → `type_text` |
 | A window screenshot shows something else | Check `capture.source` and `on_active_workspace`; activate, then `screenshot_window` |
 | `screenshot_window` returns `needs_input_session` | `prepare_input` → ask the human to approve the dialog → `screenshot_window` again |
+| `screenshot_window` returns `no_usable_geometry` | Run `env_info`, inspect the output's EIS region, and do not request authorization again |
 | The click does nothing at all | Read the reply: `hit.window` (null = desktop), `on_active_workspace`, and `other_output_match` (wrong output's screenshot space). Use `click_window` for window images |
 | An applet looks wrong | `applets` for the PID and name → `journalctl --user -b -n 100 -t <name>` → `config_read` the config → `restart_applet` if needed (and say the whole section was rebuilt) |
 | Unsure about the desktop topology | `env_info` (no side effects). Do not guess |
