@@ -291,8 +291,8 @@ in that section may also restart with new PIDs.
 
 The original config text is restored and a private backup is kept in
 `$XDG_STATE_HOME/cosmic-desktop-mcp/panel-backups/` (falling back to
-`~/.local/state/...`). Do not use `kill`/`SIGTERM`; COSMIC does not reliably respawn an
-applet that was killed.
+`~/.local/state/...`); the response lists the exact backup paths. Do not use
+`kill`/`SIGTERM`; COSMIC does not reliably respawn an applet that was killed.
 
 Backups must succeed before any config is changed. Config writes are atomic, and an error
 during panel-config discovery, reading, blanking or restoration aborts the operation rather

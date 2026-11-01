@@ -184,8 +184,8 @@ then write the original text back. The panel rebuilds the whole section, so
 `restart_applet` is really "refresh the panel" — time, workspaces and audio on that panel
 all come back with new PIDs. The tool always restores the original text and keeps a
 backup under `$XDG_STATE_HOME/cosmic-desktop-mcp/panel-backups/` (or
-`~/.local/state/...`). Unreadable panel config is an error before any change, not a section
-to skip silently.
+`~/.local/state/...`) and reports the exact paths. Unreadable panel config is an error
+before any change, not a section to skip silently.
 
 ```
 ~/.config/cosmic/com.system76.CosmicPanel/v1/entries          -> ["Panel", "Dock"]

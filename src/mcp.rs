@@ -517,7 +517,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
     plugins_* config entry that lists it. The whole panel section may be rebuilt. The original config \
     text is always written back, and a private backup lands under \
     $XDG_STATE_HOME/cosmic-desktop-mcp/panel-backups/ (or ~/.local/state/...). Accepts a full name \
-    (cosmic-applet-time) or the suffix (time).",
+    (cosmic-applet-time) or the suffix (time); the response names the backup paths.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -843,9 +843,13 @@ fn tool_restart_applet(args: &Value) -> Result<String> {
         .get("name")
         .and_then(Value::as_str)
         .context("restart_applet needs \"name\"")?;
-    let restarted = applets::restart(name)?;
+    let (restarted, backups) = applets::restart(name)?;
     Ok(serde_json::to_string_pretty(&json!({
         "restarted": restarted,
+        "backups": backups
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
         "note": "the panel respawned these from its plugins_* config, so the pids differ from the \
                  processes that existed before; the config key was restored to its original text",
     }))?)

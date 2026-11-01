@@ -167,7 +167,7 @@ fn age_seconds(pid: u32) -> Option<u64> {
 /// this is a panel refresh, not a single-applet restart. Backups are written
 /// before any config is touched, and a drop guard restores the original text
 /// if blanking or the respawn path returns early.
-pub fn restart(selector: &str) -> Result<Vec<Applet>> {
+pub fn restart(selector: &str) -> Result<(Vec<Applet>, Vec<PathBuf>)> {
     let selector = selector.trim();
     if selector.is_empty() {
         bail!("selector must not be empty");
@@ -206,9 +206,11 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
     }
 
     // Keep a copy outside the config tree before touching anything.
+    let mut backups = Vec::new();
     for (file, text) in &targets {
-        backup(file, text)
+        let path = backup(file, text)
             .with_context(|| format!("back up {} before blanking it", file.display()))?;
+        backups.push(path);
     }
 
     let mut restore = PanelRestore::new(targets);
@@ -267,7 +269,7 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
             .all(|old| !now.iter().any(|new| new.pid == old.pid));
         if old_gone && !now.is_empty() {
             std::thread::sleep(Duration::from_millis(400));
-            return Ok(list()?.into_iter().filter(matches).collect());
+            return Ok((list()?.into_iter().filter(matches).collect(), backups));
         }
         if Instant::now() >= deadline {
             bail!(
