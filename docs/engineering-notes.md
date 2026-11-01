@@ -97,7 +97,9 @@ a server-side titlebar from that source (measured with kitty: 1264x636 while the
 window is 1264x672), which makes the image incomplete. The tool rejects such a frame
 instead of guessing. If an EIS session is already open it can fall back to an output crop;
 otherwise it returns the structured error `needs_input_session`. Call `prepare_input`,
-have the human approve, then take a fresh `screenshot_window`.
+have the human approve, then take a fresh `screenshot_window`. If the session is already
+open but the output has no usable EIS region, the error is `no_usable_geometry` and points
+at `env_info` rather than asking for the same authorization again.
 
 Every successful window capture returns a `coordinates` object. Pass it unchanged to
 `click_window`, `move_window` or `scroll_window`; do not rebuild it, and do not add its

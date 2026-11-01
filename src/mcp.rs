@@ -1276,6 +1276,7 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
         .context("the window's output is not present in the current topology")?;
     let out = scene.output(output_index)?;
     let existing_geometry = scene.geoms[index].clone();
+    let input_session_open = crate::eis::peek().is_some();
 
     let (mut direct, direct_error) = match capture::capture_window(&window.identifier) {
         Ok(frame) => (frame, None),
@@ -1315,9 +1316,15 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
         );
         if existing_geometry.is_none() {
             notes.push(
-                "the input session was not opened. scale and pixels are null, but the coordinates \
-                 object is complete; click_window resolves input coordinates when it acts"
-                    .to_string(),
+                if input_session_open {
+                    "the input session is open, but this output has no usable EIS region. scale \
+                     and pixels are null; click_window will report the region problem when it acts"
+                } else {
+                    "the input session was not opened. scale and pixels are null, but the \
+                     coordinates object is complete; click_window resolves input coordinates when \
+                     it acts"
+                }
+                .to_string(),
             );
         }
         notes.push(
@@ -1334,6 +1341,7 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
                     "native_size": {"width": frame.width, "height": frame.height},
                     "coordinate_safe": true,
                 },
+                "input_session_open": input_session_open,
                 "input_session_opened": false,
                 "side_effects": [],
                 "image": {"width": frame.width, "height": frame.height},
@@ -1367,11 +1375,27 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
     }
 
     if existing_geometry.is_none() {
+        let (status, message, next_action) = if input_session_open {
+            (
+                "no_usable_geometry",
+                "direct window capture did not produce a coordinate-safe full-window image, and \
+                 this output has no usable EIS region for the output-crop fallback. The input \
+                 session is already open.",
+                "run env_info and check the EIS region mapping for this output",
+            )
+        } else {
+            (
+                "needs_input_session",
+                "direct window capture did not produce a coordinate-safe full-window image, and \
+                 the output-crop fallback needs the EIS scale. This observation tool did not open \
+                 the portal.",
+                "call prepare_input (a possible one-time system authorization dialog), then take \
+                 a new screenshot_window",
+            )
+        };
         let mut structured = json!({
-            "status": "needs_input_session",
-            "message": "direct window capture did not produce a coordinate-safe full-window image, \
-                        and the output-crop fallback needs the EIS scale. This observation tool did \
-                        not open the portal.",
+            "status": status,
+            "message": message,
             "window": window_ref(window),
             "output": {
                 "index": output_index,
@@ -1387,8 +1411,8 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
                 "coordinate_safe": false,
             },
             "direct_error": direct_error,
-            "next_action": "call prepare_input (a possible one-time system authorization dialog), \
-                            then take a new screenshot_window",
+            "input_session_open": input_session_open,
+            "next_action": next_action,
         });
         if let Some(frame) = direct.take() {
             let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)

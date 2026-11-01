@@ -134,7 +134,9 @@ logical window, the tool will not guess.
 When an input session is already open, it may fall back to an output crop. If no session is
 open and a safe direct frame is unavailable, it returns a structured error with
 `status: "needs_input_session"`. Run `prepare_input`, have a human approve, then take a new
-window screenshot.
+window screenshot. If a session is open but the output has no usable EIS region, the status
+is `no_usable_geometry` and the next step is to inspect `env_info` instead of reopening the
+session.
 
 ### `window_action`
 
