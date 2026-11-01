@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 use std::time::{Duration, Instant};
 
@@ -578,8 +578,9 @@ fn pick_format(formats: &[wl_shm::Format]) -> Result<wl_shm::Format> {
     )
 }
 
-/// Pumps the queue until `done` holds. Bounded so a silent compositor cannot
-/// hang the MCP server forever.
+/// Pumps the queue until `done` holds. Polling the socket with a deadline keeps
+/// a silent compositor from turning the five-second timeout into a blocking
+/// `roundtrip()` that never returns.
 fn wait(
     conn: &Connection,
     queue: &mut wayland_client::EventQueue<State>,
@@ -587,7 +588,13 @@ fn wait(
     done: impl Fn(&State) -> bool,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !done(state) {
+    loop {
+        queue
+            .dispatch_pending(state)
+            .context("dispatch capture events")?;
+        if done(state) {
+            return Ok(());
+        }
         if Instant::now() > deadline {
             bail!(
                 "timed out after 5s; events seen: {:?} — a session lock screen \
@@ -596,13 +603,32 @@ fn wait(
                 state.log
             );
         }
-        queue
-            .roundtrip(state)
-            .context("roundtrip while waiting for capture")?;
         conn.flush().context("flush while waiting for capture")?;
-        std::thread::sleep(Duration::from_millis(2));
+
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pollfd = libc::pollfd {
+            fd: guard.connection_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err).context("poll Wayland socket while waiting for capture");
+        }
+        if ready > 0 {
+            guard
+                .read()
+                .context("read Wayland events while waiting for capture")?;
+        }
     }
-    Ok(())
 }
 
 fn memfd(len: usize) -> Result<OwnedFd> {
