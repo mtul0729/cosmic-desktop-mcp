@@ -564,6 +564,7 @@ fn tool_definitions() -> Result<Vec<Tool>> {
 }
 
 fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
+    reject_unknown_args(name, args)?;
     let response = match name {
         "screenshot" => ToolResponse::success(tool_screenshot(args)?),
         "env_info" => ToolResponse::success(tool_env_info()?),
@@ -587,6 +588,38 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
         other => bail!("unknown tool {other:?}"),
     };
     Ok(response)
+}
+
+fn reject_unknown_args(tool: &str, args: &Value) -> Result<()> {
+    let allowed: &[&str] = match tool {
+        "screenshot" => &["output"],
+        "env_info" | "prepare_input" | "list_windows" | "applets" => &[],
+        "screenshot_window" => &["window"],
+        "window_action" => &["window", "action"],
+        "click" => &["x", "y", "button", "count", "output"],
+        "move" => &["x", "y", "output"],
+        "scroll" => &["x", "y", "dy", "dx", "output"],
+        "click_window" => &["window", "x", "y", "coordinates", "button", "count"],
+        "move_window" => &["window", "x", "y", "coordinates"],
+        "scroll_window" => &["window", "x", "y", "coordinates", "dy", "dx"],
+        "type_text" => &["text", "mode"],
+        "key" => &["combo"],
+        "workspaces" => &["activate", "group"],
+        "restart_applet" => &["name"],
+        "config_read" => &["app", "key"],
+        "config_write" => &["app", "key", "value"],
+        _ => return Ok(()),
+    };
+    let arguments = args
+        .as_object()
+        .context("tool arguments must be a JSON object")?;
+    if let Some(unknown) = arguments
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        bail!("unknown argument {unknown:?} for tool {tool:?}");
+    }
+    Ok(())
 }
 
 fn tool_screenshot(args: &Value) -> Result<String> {
@@ -874,6 +907,14 @@ impl Scene {
 
     fn from_windows(windows: Vec<Window>, open_session: bool) -> Result<Self> {
         let outputs = input::outputs()?;
+        Self::from_parts(windows, outputs, open_session)
+    }
+
+    fn from_parts(
+        windows: Vec<Window>,
+        outputs: Vec<capture::OutputInfo>,
+        open_session: bool,
+    ) -> Result<Self> {
         let regions = if open_session {
             crate::eis::session()?.regions()
         } else {
@@ -958,6 +999,17 @@ impl Scene {
             .collect();
         coords::hit_test(&candidates, x, y)
     }
+}
+
+/// Validates output-relative coordinates before opening the input session.
+fn load_scene_for_output(output: usize, x: i32, y: i32) -> Result<Scene> {
+    let windows = toplevel::list()?;
+    let outputs = input::outputs()?;
+    let out = outputs
+        .get(output)
+        .with_context(|| format!("no output #{output} (there are {})", outputs.len()))?;
+    point_in_output(out, x, y)?;
+    Scene::from_parts(windows, outputs, true)
 }
 
 fn output_json(out: &capture::OutputInfo) -> Value {
@@ -1668,9 +1720,8 @@ fn tool_click(args: &Value) -> Result<String> {
     let count = count_arg(args)?;
     let output = output_arg(args)?;
 
-    let scene = Scene::load(true)?;
+    let scene = load_scene_for_output(output, x, y)?;
     let out = scene.output(output)?;
-    point_in_output(out, x, y)?;
     let region = input::region_for(out, &scene.regions)?.region;
     let (lx, ly) = (
         region.x + f64::from(x) / region.scale,
@@ -1709,9 +1760,8 @@ fn tool_move(args: &Value) -> Result<String> {
     let y = int_arg(args, "y")?;
     let output = output_arg(args)?;
 
-    let scene = Scene::load(true)?;
+    let scene = load_scene_for_output(output, x, y)?;
     let out = scene.output(output)?;
-    point_in_output(out, x, y)?;
     let region = input::region_for(out, &scene.regions)?.region;
     let (lx, ly) = (
         region.x + f64::from(x) / region.scale,
@@ -1750,9 +1800,8 @@ fn tool_scroll(args: &Value) -> Result<String> {
     let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
     let output = output_arg(args)?;
 
-    let scene = Scene::load(true)?;
+    let scene = load_scene_for_output(output, x, y)?;
     let out = scene.output(output)?;
-    point_in_output(out, x, y)?;
     let region = input::region_for(out, &scene.regions)?.region;
     let (lx, ly) = (
         region.x + f64::from(x) / region.scale,
@@ -1793,6 +1842,7 @@ fn tool_click_window(args: &Value) -> Result<String> {
     let button = button_arg(args)?;
     let count = count_arg(args)?;
     let coordinates = window_coordinates_arg(args)?;
+    coords::check_image_point(coordinates.image, x, y)?;
 
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
@@ -1856,6 +1906,7 @@ fn tool_move_window(args: &Value) -> Result<String> {
     let x = int_arg(args, "x")?;
     let y = int_arg(args, "y")?;
     let coordinates = window_coordinates_arg(args)?;
+    coords::check_image_point(coordinates.image, x, y)?;
 
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
@@ -1919,6 +1970,7 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
     let dy = optional_i32_arg(args, "dy")?.unwrap_or(0);
     let dx = optional_i32_arg(args, "dx")?.unwrap_or(0);
     let coordinates = window_coordinates_arg(args)?;
+    coords::check_image_point(coordinates.image, x, y)?;
 
     let windows = toplevel::list()?;
     let target = toplevel::find(&windows, needle)?;
@@ -2424,6 +2476,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires \"app\""), "{err}");
+    }
+
+    #[test]
+    fn unknown_arguments_are_errors_instead_of_being_ignored() {
+        let err = reject_unknown_args("click", &json!({"x": 1, "y": 2, "outpu": 0}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown argument \"outpu\""), "{err}");
+
+        assert!(reject_unknown_args("click", &json!({"x": 1, "y": 2, "output": 0})).is_ok());
+        assert!(reject_unknown_args("applets", &json!({})).is_ok());
     }
 
     #[test]

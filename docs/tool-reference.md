@@ -5,7 +5,8 @@ return structured JSON text. Pointer and window tools also return enough context
 what they requested.
 
 Optional arguments use their documented default only when omitted or `null`. A present
-value with the wrong type or range is an error, not a fallback to the default.
+value with the wrong type or range is an error, not a fallback to the default. Unknown
+argument names are rejected, so a misspelled `output` cannot silently become output `0`.
 
 ## Conventions
 

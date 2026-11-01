@@ -100,7 +100,7 @@ pub fn direct_image_to_output(
     ))
 }
 
-fn check_image_point(image: (u32, u32), x: i32, y: i32) -> Result<()> {
+pub(crate) fn check_image_point(image: (u32, u32), x: i32, y: i32) -> Result<()> {
     if x < 0 || y < 0 || x >= image.0 as i32 || y >= image.1 as i32 {
         bail!(
             "point ({x}, {y}) is outside the window image, which is {}x{}; take the point from a \
