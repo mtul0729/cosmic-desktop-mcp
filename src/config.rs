@@ -72,36 +72,49 @@ pub fn read(app: Option<&str>, key: Option<&str>) -> Result<Value> {
             }
         }
         None => {
-            let entries = std::fs::read_dir(&dir).with_context(|| {
+            let keys = read_entries(&dir).with_context(|| {
                 format!(
-                    "{} does not exist — is {app:?} the right app id?",
+                    "read config for {app:?} from {} — is that the right app id?",
                     dir.display()
                 )
             })?;
-            let mut keys = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let key = entry.file_name().to_string_lossy().into_owned();
-                let raw = std::fs::read_to_string(&path).unwrap_or_default();
-                keys.push(json!({"key": key, "value": raw.trim()}));
-            }
-            keys.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
             Ok(json!({"app": app, "dir": dir.display().to_string(), "entries": keys}))
         }
     }
 }
 
+fn read_entries(dir: &Path) -> Result<Vec<Value>> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    let mut keys = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read an entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let key = entry.file_name().to_string_lossy().into_owned();
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read config value {}", path.display()))?;
+        keys.push(json!({"key": key, "value": raw.trim()}));
+    }
+    keys.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    Ok(keys)
+}
+
 fn list_apps() -> Result<Vec<String>> {
     let root = config_root()?;
     let mut apps = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                apps.push(entry.file_name().to_string_lossy().into_owned());
-            }
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(apps),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read config root {}", root.display()));
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read an entry in {}", root.display()))?;
+        if entry.path().is_dir() {
+            apps.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
     apps.sort();
@@ -168,4 +181,43 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cosmic-desktop-mcp-config-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unreadable_values_are_errors_not_empty_strings() {
+        let temp = TempDir::new();
+        std::fs::write(temp.0.join("broken"), [0xff, 0xfe]).unwrap();
+
+        let err = read_entries(&temp.0).unwrap_err().to_string();
+
+        assert!(err.contains("broken"), "{err}");
+    }
 }
