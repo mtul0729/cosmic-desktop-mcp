@@ -1,10 +1,13 @@
 //! MCP server over stdio, using the official Rust SDK.
 
-use std::path::PathBuf;
+use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -627,19 +630,9 @@ fn tool_screenshot(args: &Value) -> Result<String> {
         )
     })?;
 
-    let dir = runtime_dir().join("cosmic-desktop-mcp");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = dir.join(format!("shot-{stamp}.png"));
-
     let image = image::RgbaImage::from_raw(shot.width, shot.height, shot.rgba)
         .context("captured frame did not match its declared size")?;
-    image
-        .save_with_format(&path, image::ImageFormat::Png)
-        .with_context(|| format!("write {}", path.display()))?;
+    let path = save_png(&image, "shot")?;
 
     let mut notes = vec![
         "this image is output screenshot pixel space: pass (x, y) from it to click/move/scroll \
@@ -2115,22 +2108,59 @@ fn int_arg(args: &Value, key: &str) -> Result<i32> {
     i32::try_from(value).with_context(|| format!("argument {key:?} out of range"))
 }
 
-fn runtime_dir() -> PathBuf {
-    crate::session::runtime_dir().unwrap_or_else(|_| std::env::temp_dir())
+fn screenshot_dir_at(runtime_dir: &Path) -> Result<PathBuf> {
+    let dir = runtime_dir.join("cosmic-desktop-mcp");
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(&dir, Permissions::from_mode(0o700))
+        .with_context(|| format!("make {} private", dir.display()))?;
+    Ok(dir)
+}
+
+fn screenshot_dir() -> Result<PathBuf> {
+    screenshot_dir_at(&crate::session::runtime_dir()?)
+}
+
+fn save_png_at(dir: &Path, prefix: &str, image: &image::RgbaImage) -> Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("{prefix}-{stamp}.png"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    let encoded = PngEncoder::new(&mut file)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .with_context(|| format!("encode {}", path.display()))
+        .and_then(|()| {
+            file.sync_all()
+                .with_context(|| format!("sync {}", path.display()))
+        });
+    if let Err(err) = encoded {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok(path)
+}
+
+fn save_png(image: &image::RgbaImage, prefix: &str) -> Result<PathBuf> {
+    save_png_at(&screenshot_dir()?, prefix, image)
 }
 
 fn save_window_png(image: &image::RgbaImage) -> Result<PathBuf> {
-    let dir = runtime_dir().join("cosmic-desktop-mcp");
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = dir.join(format!("window-{stamp}.png"));
-    image
-        .save_with_format(&path, image::ImageFormat::Png)
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+    save_png(image, "window")
 }
 
 /// `--doctor` output: proves the three moving parts work without running a
@@ -2177,7 +2207,32 @@ pub fn doctor() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cosmic-desktop-mcp-artifacts-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn rmcp_advertises_the_expected_server_and_tool_capability() {
@@ -2347,6 +2402,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires \"app\""), "{err}");
+    }
+
+    #[test]
+    fn screenshot_artifacts_are_private() {
+        let temp = TempDir::new();
+        let dir = screenshot_dir_at(&temp.0).unwrap();
+        let path = save_png_at(&dir, "test", &image::RgbaImage::new(1, 1)).unwrap();
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! the shared `Connection`. Buffering commands behind the blocking event read
 //! is not an option: that read has no timeout of its own.
 
+use std::ffi::OsStr;
 use std::fs::{DirBuilder, OpenOptions, Permissions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -529,21 +530,44 @@ async fn open_session() -> Result<(ei::Context, Option<String>)> {
     ))
 }
 
+fn state_base_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
+    if let Some(dir) = xdg_state_home.filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            bail!("XDG_STATE_HOME is not absolute: {}", dir.display());
+        }
+        return Ok(dir);
+    }
+
+    let home = home
+        .filter(|value| !value.is_empty())
+        .context("neither XDG_STATE_HOME nor HOME is set")?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        bail!("HOME is not absolute: {}", home.display());
+    }
+    Ok(home.join(".local/state"))
+}
+
 /// `$XDG_STATE_HOME/cosmic-desktop-mcp/restore-token`, falling back to
 /// `~/.local/state/...`. The token grants remote input, so the file and its
 /// directory are kept private.
-fn token_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
-    Some(base.join("cosmic-desktop-mcp/restore-token"))
+fn token_path() -> Result<PathBuf> {
+    let xdg_state_home = std::env::var_os("XDG_STATE_HOME");
+    let home = std::env::var_os("HOME");
+    Ok(state_base_from(xdg_state_home.as_deref(), home.as_deref())?
+        .join("cosmic-desktop-mcp/restore-token"))
 }
 
 fn load_token() -> (Option<String>, Option<String>) {
-    let Some(path) = token_path() else {
-        return (None, None);
+    let path = match token_path() {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                None,
+                Some(format!("could not locate the restore token: {err:#}")),
+            );
+        }
     };
     load_token_at(&path)
 }
@@ -603,7 +627,7 @@ fn load_token_at(path: &Path) -> (Option<String>, Option<String>) {
 }
 
 fn store_token(token: &str) -> Result<()> {
-    let path = token_path().context("neither XDG_STATE_HOME nor HOME is set")?;
+    let path = token_path()?;
     let dir = path.parent().context("restore token path has no parent")?;
     create_private_dir(dir)?;
     write_private_file(&path, token)
@@ -732,5 +756,17 @@ mod tests {
         );
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn empty_state_home_falls_back_to_home() {
+        let path = state_base_from(Some(OsStr::new("")), Some(OsStr::new("/home/tester"))).unwrap();
+        assert_eq!(path, PathBuf::from("/home/tester/.local/state"));
+    }
+
+    #[test]
+    fn relative_state_locations_are_rejected() {
+        assert!(state_base_from(Some(OsStr::new("state")), None).is_err());
+        assert!(state_base_from(None, Some(OsStr::new("home"))).is_err());
     }
 }
