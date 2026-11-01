@@ -113,6 +113,10 @@ fn read_entries(dir: &Path) -> Result<Vec<Value>> {
             continue;
         }
         let key = entry.file_name().to_string_lossy().into_owned();
+        if key.starts_with('.') {
+            // Atomic writes leave hidden temporary files only on a hard crash.
+            continue;
+        }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("read config value {}", path.display()))?;
         keys.push(json!({"key": key, "value": raw}));
@@ -268,9 +272,11 @@ mod tests {
     fn config_values_keep_their_exact_text_for_rollback() {
         let temp = TempDir::new();
         std::fs::write(temp.0.join("setting"), "true\n").unwrap();
+        std::fs::write(temp.0.join(".setting.123.tmp"), "stale").unwrap();
 
         let entries = read_entries(&temp.0).unwrap();
 
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["value"], "true\n");
     }
 
