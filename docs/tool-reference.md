@@ -289,7 +289,9 @@ The original config text is restored and a private backup is kept in
 applet that was killed.
 
 Backups must succeed before any config is changed. Config writes are atomic, and an error
-during blanking or restoration triggers a best-effort restore through a drop guard.
+during panel-config discovery, reading, blanking or restoration aborts the operation rather
+than skipping a section. An error during blanking or restoration also triggers a
+best-effort restore through a drop guard.
 
 Applet logs are intentionally not an MCP tool. The
 [operations skill](../skill/cosmic-desktop-ops/SKILL.md) gives the `journalctl` recipe to use

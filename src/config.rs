@@ -11,7 +11,13 @@
 //! quotes and enums keep their variant names. Nothing here parses RON, which
 //! keeps the tool honest about what it can and cannot validate.
 
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -31,16 +37,30 @@ fn check_component(kind: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn config_root() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let home =
-                std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
-            PathBuf::from(home).join(".config")
+fn config_root_from(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
+    let base = if let Some(dir) = xdg_config_home.filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            bail!("XDG_CONFIG_HOME is not absolute: {}", dir.display());
         }
+        dir
+    } else {
+        let home = home
+            .filter(|value| !value.is_empty())
+            .context("neither XDG_CONFIG_HOME nor HOME is set")?;
+        let home = PathBuf::from(home);
+        if !home.is_absolute() {
+            bail!("HOME is not absolute: {}", home.display());
+        }
+        home.join(".config")
     };
     Ok(base.join("cosmic"))
+}
+
+pub(crate) fn config_root() -> Result<PathBuf> {
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    config_root_from(xdg_config_home.as_deref(), home.as_deref())
 }
 
 fn app_dir(app: &str) -> Result<PathBuf> {
@@ -171,21 +191,44 @@ pub fn write(app: &str, key: &str, value: Option<&str>) -> Result<Value> {
 /// Writes through a temporary file in the same directory, so a watcher never
 /// observes a half-written value.
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
     let dir = path.parent().context("config path has no parent")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     let tmp = dir.join(format!(
-        ".{}.tmp",
+        ".{}.{}-{stamp}-{}.tmp",
         path.file_name()
             .map(|name| name.to_string_lossy())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, contents).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
@@ -219,5 +262,32 @@ mod tests {
         let err = read_entries(&temp.0).unwrap_err().to_string();
 
         assert!(err.contains("broken"), "{err}");
+    }
+
+    #[test]
+    fn relative_config_roots_are_rejected() {
+        assert!(config_root_from(Some(OsStr::new("config")), None).is_err());
+        assert!(config_root_from(None, Some(OsStr::new("home"))).is_err());
+        assert_eq!(
+            config_root_from(Some(OsStr::new("")), Some(OsStr::new("/home/tester"))).unwrap(),
+            PathBuf::from("/home/tester/.config/cosmic")
+        );
+    }
+
+    #[test]
+    fn atomic_writes_are_private_and_leave_no_temporary_file() {
+        let temp = TempDir::new();
+        let path = temp.0.join("setting");
+
+        write_atomic(&path, "true").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "true");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let entries: Vec<_> = std::fs::read_dir(&temp.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsStr::new("setting")]);
     }
 }

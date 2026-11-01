@@ -185,10 +185,9 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
     let wanted = plugin_candidates(&before);
 
     let mut targets: Vec<(PathBuf, String)> = Vec::new();
-    for file in panel_config_files() {
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
+    for file in panel_config_files()? {
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("read panel config {}", file.display()))?;
         let listed: BTreeSet<String> = quoted_strings(&text).into_iter().collect();
         if listed.iter().any(|entry| wanted.contains(entry)) {
             targets.push((file, text));
@@ -200,7 +199,7 @@ pub fn restart(selector: &str) -> Result<Vec<Applet>> {
              touch anything. Looked for {:?} under {}",
             before.len(),
             wanted,
-            config_root()
+            crate::config::config_root()
                 .map(|root| root.display().to_string())
                 .unwrap_or_default()
         );
@@ -370,29 +369,28 @@ fn quoted_strings(text: &str) -> Vec<String> {
     out
 }
 
-fn config_root() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let home =
-                std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?;
-            PathBuf::from(home).join(".config")
-        }
-    };
-    Ok(base.join("cosmic"))
-}
-
-fn panel_config_files() -> Vec<PathBuf> {
+fn panel_config_files() -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    let Ok(root) = config_root() else {
-        return files;
-    };
+    let root = crate::config::config_root()?;
     for app in PANEL_APPS {
         let dir = root.join(app).join("v1");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read panel config directory {}", dir.display()));
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read an entry in {}", dir.display()))?;
+            if !entry
+                .file_type()
+                .with_context(|| format!("inspect {}", entry.path().display()))?
+                .is_file()
+            {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("plugins_") {
                 files.push(entry.path());
@@ -400,7 +398,7 @@ fn panel_config_files() -> Vec<PathBuf> {
         }
     }
     files.sort();
-    files
+    Ok(files)
 }
 
 fn state_base_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
