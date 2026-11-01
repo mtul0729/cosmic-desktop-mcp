@@ -275,9 +275,10 @@ Blinks and rewrites the panel `plugins_*` config entry to make COSMIC respawn th
 This is a **panel-section refresh**, not a targeted single-process restart: other applets
 in that section may also restart with new PIDs.
 
-The original config text is restored and a backup is kept in
-`~/.local/state/cosmic-desktop-mcp/panel-backups/`. Do not use `kill`/`SIGTERM`; COSMIC does
-not reliably respawn an applet that was killed.
+The original config text is restored and a private backup is kept in
+`$XDG_STATE_HOME/cosmic-desktop-mcp/panel-backups/` (falling back to
+`~/.local/state/...`). Do not use `kill`/`SIGTERM`; COSMIC does not reliably respawn an
+applet that was killed.
 
 Backups must succeed before any config is changed. Config writes are atomic, and an error
 during blanking or restoration triggers a best-effort restore through a drop guard.

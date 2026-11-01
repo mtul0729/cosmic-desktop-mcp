@@ -14,8 +14,12 @@
 //! `/proc/<pid>/comm` (which reads `.cosmic-applets` for all of them).
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -399,14 +403,44 @@ fn panel_config_files() -> Vec<PathBuf> {
     files
 }
 
-fn backup_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".local/state/cosmic-desktop-mcp/panel-backups"))
+fn state_base_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
+    if let Some(dir) = xdg_state_home.filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        if !dir.is_absolute() {
+            bail!("XDG_STATE_HOME is not absolute: {}", dir.display());
+        }
+        return Ok(dir);
+    }
+
+    let home = home
+        .filter(|value| !value.is_empty())
+        .context("neither XDG_STATE_HOME nor HOME is set")?;
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        bail!("HOME is not absolute: {}", home.display());
+    }
+    Ok(home.join(".local/state"))
+}
+
+fn backup_dir() -> Result<PathBuf> {
+    let xdg_state_home = std::env::var_os("XDG_STATE_HOME");
+    let home = std::env::var_os("HOME");
+    Ok(state_base_from(xdg_state_home.as_deref(), home.as_deref())?
+        .join("cosmic-desktop-mcp/panel-backups"))
 }
 
 fn backup(file: &Path, text: &str) -> Result<PathBuf> {
-    let dir = backup_dir().context("HOME is not set")?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    backup_at(&backup_dir()?, file, text)
+}
+
+fn backup_at(dir: &Path, file: &Path, text: &str) -> Result<PathBuf> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(dir, Permissions::from_mode(0o700))
+        .with_context(|| format!("make {} private", dir.display()))?;
     let name = file
         .parent()
         .and_then(Path::file_name)
@@ -417,8 +451,43 @@ fn backup(file: &Path, text: &str) -> Result<PathBuf> {
         .map(|key| key.to_string_lossy().into_owned())
         .unwrap_or_default();
     let path = dir.join(format!("{name}__{key}"));
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    write_private_atomic(&path, text)?;
     Ok(path)
+}
+
+fn write_private_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path.parent().context("backup path has no parent")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".{}.{}-{stamp}.tmp",
+        path.file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+        std::fs::set_permissions(path, Permissions::from_mode(0o600))
+            .with_context(|| format!("make {} private", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -477,5 +546,21 @@ mod tests {
         }
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    }
+
+    #[test]
+    fn panel_backups_are_private_and_complete() {
+        let temp = TempDir::new();
+        let source = temp.0.join("plugins_center");
+        let backup_dir = temp.0.join("backups");
+        let original = "[\"com.system76.CosmicAppletTime\"]";
+
+        let path = backup_at(&backup_dir, &source, original).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let dir_mode = std::fs::metadata(&backup_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 }

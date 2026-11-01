@@ -531,9 +531,9 @@ fn tool_definitions() -> Result<Vec<Tool>> {
     applet: a plain SIGTERM leaves the slot empty, because cosmic-panel does not supervise its applets \
     even though it builds a launch-pad ProcessManager. In practice the panel rebuilds every applet on \
     that section (time, workspaces and audio all get new pids), so treat this as a panel refresh. The \
-    original config text is always written back, and a backup lands in \
-    ~/.local/state/cosmic-desktop-mcp/panel-backups/. Accepts a full name (cosmic-applet-time) or the \
-    suffix (time).",
+    original config text is always written back, and a private backup lands under \
+    $XDG_STATE_HOME/cosmic-desktop-mcp/panel-backups/ (or ~/.local/state/...). Accepts a full name \
+    (cosmic-applet-time) or the suffix (time).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
