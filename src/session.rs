@@ -6,15 +6,18 @@
 //! user and can reach the session's socket, but `WAYLAND_DISPLAY` and
 //! `XDG_SESSION_ID` are not in their environment.
 
-use std::{path::PathBuf, process::Command};
+use std::{ffi::OsStr, path::PathBuf, process::Command};
 
 use anyhow::{Result, bail};
 
-pub fn runtime_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+fn runtime_dir_from(xdg_runtime_dir: Option<&OsStr>) -> Result<PathBuf> {
+    if let Some(dir) = xdg_runtime_dir.filter(|value| !value.is_empty()) {
         let dir = PathBuf::from(dir);
         if !dir.is_absolute() {
             bail!("XDG_RUNTIME_DIR is not absolute: {}", dir.display());
+        }
+        if !dir.is_dir() {
+            bail!("XDG_RUNTIME_DIR is not a directory: {}", dir.display());
         }
         return Ok(dir);
     }
@@ -29,6 +32,11 @@ pub fn runtime_dir() -> Result<PathBuf> {
             dir.display()
         )
     }
+}
+
+pub fn runtime_dir() -> Result<PathBuf> {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR");
+    runtime_dir_from(dir.as_deref())
 }
 
 pub fn login_session_id() -> Option<String> {
@@ -60,7 +68,42 @@ fn parse_session_id(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "cosmic-desktop-mcp-session-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn runtime_directory_must_exist_and_be_absolute() {
+        let temp = TempDir::new();
+        assert_eq!(runtime_dir_from(Some(temp.0.as_os_str())).unwrap(), temp.0);
+        assert!(runtime_dir_from(Some(OsStr::new("runtime"))).is_err());
+        assert!(
+            runtime_dir_from(Some(Path::new("/definitely/not/a/runtime/dir").as_os_str())).is_err()
+        );
+    }
 
     #[test]
     fn reads_the_display_session_from_loginctl() {

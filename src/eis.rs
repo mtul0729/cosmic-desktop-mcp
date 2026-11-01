@@ -656,8 +656,7 @@ fn write_private_file(path: &Path, contents: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;

@@ -60,8 +60,8 @@ keeps a backup. Screenshots return their path and dimensions. An action that can
 verified should say so rather than present a success summary as certainty.
 
 Screenshots and secret-bearing state stay private: directories are created as `0700`, files
-as `0600`, and a missing user runtime directory is an error rather than a fallback to shared
-`/tmp`.
+as `0600`, and a missing or invalid user runtime directory is an error rather than a
+fallback to shared `/tmp`.
 
 ### 7. Keep authorization human-controlled
 
