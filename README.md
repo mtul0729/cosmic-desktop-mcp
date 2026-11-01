@@ -29,7 +29,6 @@ side effects, coordinate handling and error behaviour.
 | Look | Capture the whole screen or one window; list windows, geometry and workspace membership |
 | Control | Move, click, double-click, scroll, type text, send key chords, switch workspaces |
 | Windows | Activate, close, minimize, maximize and fullscreen a window |
-| Clipboard | Read and write text without immediately pasting it |
 | COSMIC debugging | List panel applets, refresh a panel section, read/write COSMIC config |
 
 See the [tool reference](docs/tool-reference.md) for every tool and argument.
@@ -41,7 +40,7 @@ See the [tool reference](docs/tool-reference.md) for every tool and argument.
 - [Nix](https://nixos.org/) with flakes for the recommended install. A regular Rust build is
   also supported.
 
-The Nix package bundles `wl-clipboard`, which the clipboard and paste tools use.
+The Nix package bundles `wl-clipboard`, which `type_text` paste mode uses internally.
 
 ## Quick start
 
@@ -138,7 +137,7 @@ cargo build --release
 ```
 
 For a Cargo build outside the development shell, install `wl-clipboard` and make sure
-`wl-copy` / `wl-paste` are on `PATH`.
+`wl-copy` is on `PATH`.
 
 ## First session
 
@@ -202,7 +201,7 @@ contains `other_output_match`, the coordinates belong to another output's screen
 | Observation | `screenshot`, `list_windows`, `screenshot_window` |
 | Windows | `window_action` |
 | Pointer | `click`, `move`, `scroll`, `click_window`, `move_window`, `scroll_window` |
-| Keyboard and clipboard | `type_text`, `key`, `clipboard_write`, `clipboard_read` |
+| Keyboard | `type_text`, `key` |
 | Workspaces | `workspaces` |
 | COSMIC debugging | `applets`, `restart_applet`, `config_read`, `config_write` |
 

@@ -1,8 +1,8 @@
 # Tool reference
 
-This page describes the tools exposed by `cosmic-desktop-mcp` over MCP. Most tools return
-structured JSON text; clipboard reads return plain text, and simple actions return a short
-status line. Pointer and window tools also return enough context to verify what they did.
+This page describes the tools exposed by `cosmic-desktop-mcp` over MCP. Successful calls
+return structured JSON text. Pointer and window tools also return enough context to verify
+what they requested.
 
 Optional arguments use their documented default only when omitted or `null`. A present
 value with the wrong type or range is an error, not a fallback to the default.
@@ -217,7 +217,7 @@ point in the window image.
 Scrolls at a point in the window image. Uses the same freshness and coordinate validation
 as `click_window`.
 
-## Keyboard and clipboard
+## Keyboard
 
 ### `type_text`
 
@@ -243,19 +243,6 @@ Text goes to the **currently focused** window. Activate the intended window firs
 
 Sends one chord to the currently focused window. The key table assumes a US layout; use
 `type_text` for text on other layouts.
-
-### `clipboard_write`
-
-| Argument | Type | Required | Meaning |
-|---|---|---|---|
-| `text` | string | yes | Text to put on the clipboard |
-
-Writes text without pasting it. The selection belongs to the MCP server process, so it
-disappears when the server exits.
-
-### `clipboard_read`
-
-Reads the current clipboard as text. No arguments.
 
 ## Workspaces
 

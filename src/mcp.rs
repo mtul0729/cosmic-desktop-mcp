@@ -35,7 +35,7 @@ const INPUT_VERIFICATION_NOTE: &str = "EIS accepted the input request, but the c
 acknowledge delivery; take a new screenshot to verify the result.";
 
 pub fn serve() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("create tokio runtime")?
@@ -46,7 +46,9 @@ pub fn serve() -> Result<()> {
                 .context("initialize MCP server")?;
             running.waiting().await.context("run MCP server")?;
             Ok(())
-        })
+        });
+    clipboard::shutdown();
+    result
 }
 
 #[derive(Clone, Default)]
@@ -486,22 +488,6 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             }
         },
         {
-            "name": "clipboard_write",
-            "description": "Put text on the clipboard without pasting it. Useful when the target \
-    cannot take ctrl+v, or when the same text is pasted several times. The entry lives as long as \
-    this server process.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"]
-            }
-        },
-        {
-            "name": "clipboard_read",
-            "description": "Read the current clipboard as text.",
-            "inputSchema": {"type": "object", "properties": {}}
-        },
-        {
             "name": "key",
             "description": "Press a key combination, e.g. \"ctrl+s\", \"alt+tab\", \"Return\".",
             "inputSchema": {
@@ -610,8 +596,6 @@ fn dispatch_tool(name: &str, args: &Value) -> Result<ToolResponse> {
         "move_window" => ToolResponse::success(tool_move_window(args)?),
         "scroll_window" => ToolResponse::success(tool_scroll_window(args)?),
         "type_text" => ToolResponse::success(tool_type_text(args)?),
-        "clipboard_write" => ToolResponse::success(tool_clipboard_write(args)?),
-        "clipboard_read" => ToolResponse::success(tool_clipboard_read()?),
         "key" => ToolResponse::success(tool_key(args)?),
         "workspaces" => ToolResponse::success(tool_workspaces(args)?),
         "applets" => ToolResponse::success(tool_applets()?),
@@ -2080,22 +2064,6 @@ fn tool_type_text(args: &Value) -> Result<String> {
     }
 }
 
-fn tool_clipboard_write(args: &Value) -> Result<String> {
-    let text = args
-        .get("text")
-        .and_then(Value::as_str)
-        .context("missing text")?;
-    clipboard::write(text)?;
-    Ok(format!(
-        "clipboard set ({} characters)",
-        text.chars().count()
-    ))
-}
-
-fn tool_clipboard_read() -> Result<String> {
-    clipboard::read()
-}
-
 fn tool_key(args: &Value) -> Result<String> {
     let combo = args
         .get("combo")
@@ -2337,8 +2305,6 @@ mod tests {
                 "move_window",
                 "scroll_window",
                 "type_text",
-                "clipboard_write",
-                "clipboard_read",
                 "key",
                 "workspaces",
                 "applets",

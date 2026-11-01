@@ -136,8 +136,9 @@ to output pixels and logical coordinates and says which ones it used.
 4. **take another screenshot to confirm.** Never assume an action landed: the
    compositor is free to ignore requests (see below).
 
-For a read-only probe use `move` (hover) instead of `click`. `clipboard_read`
-is worth checking before pasting anything.
+For a read-only probe use `move` (hover) instead of `click`. There is no
+clipboard-read MCP tool; use `wl-paste --no-newline` from a shell when the
+clipboard contents are relevant.
 
 ## The focus trap (most common, most often mistaken for a broken tool)
 
@@ -262,8 +263,9 @@ raw RON.
   first: under fcitx5 in Chinese mode, `abc123` turns into candidates. That is
   why `type_text` defaults to clipboard + ctrl+v; `mode: "keys"` is only for
   when no input method is active.
-- **The clipboard lives with the MCP server process.** Exit the server and the
-  selection is gone.
+- **The clipboard is owned by a `wl-copy` child of the MCP server.** A normal
+  server shutdown terminates it and clears the selection; a hard kill may leave
+  the child and its selection behind.
 - **Scroll direction:** positive `dy` scrolls **up** (`input.rs` flips it). To
   test whether scrolling works, put the target at the *top* of a scrollable area
   and scroll down; testing downward scroll at the bottom of a list proves

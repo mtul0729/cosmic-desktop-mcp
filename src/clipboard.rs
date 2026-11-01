@@ -10,8 +10,8 @@
 //! way; wl-clipboard already handles that, the mime negotiation, and the
 //! XWayland `STRING`/`UTF8_STRING` bridge that Electron and Chrome apps need.
 //!
-//! Consequence worth knowing: the payload lives exactly as long as this
-//! process. When the MCP server exits, the clipboard entry goes with it.
+//! The payload lives while the `wl-copy` owner is alive. Normal MCP server
+//! shutdown terminates that owner; a hard kill may leave it behind.
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -27,11 +27,10 @@ static OWNER: Mutex<Option<Child>> = Mutex::new(None);
 pub fn write(text: &str) -> Result<()> {
     let mut owner = OWNER
         .lock()
-        .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if let Some(mut previous) = owner.take() {
-        let _ = previous.kill();
-        let _ = previous.wait();
+        stop(&mut previous);
     }
 
     let mut child = Command::new("wl-copy")
@@ -42,11 +41,18 @@ pub fn write(text: &str) -> Result<()> {
         .spawn()
         .context("spawn wl-copy (wl-clipboard must be on PATH)")?;
 
-    {
-        let stdin = child.stdin.as_mut().context("wl-copy stdin")?;
+    let written = {
+        let Some(stdin) = child.stdin.as_mut() else {
+            stop(&mut child);
+            bail!("wl-copy stdin was not available");
+        };
         stdin
             .write_all(text.as_bytes())
-            .context("write clipboard payload")?;
+            .context("write clipboard payload")
+    };
+    if let Err(err) = written {
+        stop(&mut child);
+        return Err(err);
     }
     // Closing stdin is what tells wl-copy the payload is complete.
     drop(child.stdin.take());
@@ -54,29 +60,38 @@ pub fn write(text: &str) -> Result<()> {
     // wl-copy exits immediately when it cannot take the selection, e.g. when
     // another client owns it and refuses to hand it over.
     std::thread::sleep(Duration::from_millis(150));
-    if let Ok(Some(status)) = child.try_wait() {
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            use std::io::Read as _;
-            let _ = pipe.read_to_string(&mut stderr);
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                use std::io::Read as _;
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            bail!("wl-copy exited early ({status}): {}", stderr.trim());
         }
-        bail!("wl-copy exited early ({status}): {}", stderr.trim());
+        Ok(None) => {}
+        Err(err) => {
+            stop(&mut child);
+            return Err(err).context("check wl-copy after starting it");
+        }
     }
 
     *owner = Some(child);
     Ok(())
 }
 
-pub fn read() -> Result<String> {
-    let output = Command::new("wl-paste")
-        .arg("--no-newline")
-        .output()
-        .context("spawn wl-paste (wl-clipboard must be on PATH)")?;
-    if !output.status.success() {
-        bail!(
-            "wl-paste failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+/// Stops the process that currently owns the selection. Called on normal MCP
+/// server shutdown; `Child` itself does not kill its process when dropped.
+pub fn shutdown() {
+    let mut owner = OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mut child) = owner.take() {
+        stop(&mut child);
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }

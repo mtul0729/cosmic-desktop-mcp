@@ -73,8 +73,6 @@ locked.
 | `scroll_window` | Wheel at window image coordinates | EIS + zcosmic-toplevel-info |
 | `type_text` | **Clipboard + ctrl+v by default**; `mode:"keys"` sends keycodes instead | wl-clipboard + EIS |
 | `key` | Chord such as `ctrl+s` | EIS |
-| `clipboard_write` | Put text on the clipboard without pasting | wl-copy (from wl-clipboard) |
-| `clipboard_read` | Read the clipboard | wl-paste |
 | `workspaces` | List / switch workspaces (group + name + state) | ext-workspace-manager |
 | `applets` | List panel applet processes: name / PID / parent / memory / age | /proc |
 | `restart_applet` | Refresh a panel applet (rewrites the `plugins_*` config) | cosmic-panel config files |
@@ -326,10 +324,9 @@ flake: `nix run github:mtul0729/cosmic-desktop-mcp`.
    `mode:"keys"`, accepts printable ASCII only, and is right only when no input method is
    active or real key events are actually wanted. The clipboard is provided by
    wl-clipboard (packaged into the PATH automatically, nothing to install). Verified:
-   `clipboard_write` round-trips Chinese text intact and also offers the XWayland
-   compatibility types `TEXT`/`STRING`/`UTF8_STRING`, so Chrome/Electron apps can paste.
-   One property to keep in mind: a Wayland selection lives as long as its owning process,
-   so the clipboard is gone once the MCP server exits.
+   paste mode round-trips Chinese text intact and also offers the XWayland compatibility
+   types `TEXT`/`STRING`/`UTF8_STRING`, so Chrome/Electron apps can paste. Normal server
+   shutdown terminates the `wl-copy` owner; a hard kill may leave the selection behind.
 2. **Clicks do not move keyboard focus.** After `click`, `type_text` still goes to the
    window that was focused **before** the click, not the one just clicked. There is a fix:
    `window_action {action:"activate"}` through zcosmic-toplevel-manager moves focus
