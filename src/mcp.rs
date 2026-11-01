@@ -1093,6 +1093,24 @@ fn pointer_notes(window: &Window, geometry: &WindowGeometry) -> Vec<String> {
     notes
 }
 
+fn ensure_window_targetable(window: &Window) -> Result<()> {
+    if window.on_active_workspace == Some(false) {
+        bail!(
+            "{:?} is on an inactive workspace; its geometry does not describe the pixels currently \
+             shown on that output. Activate the window or switch workspaces first.",
+            window.title
+        );
+    }
+    if window.state.iter().any(|state| state == "minimized") {
+        bail!(
+            "{:?} is minimized; its geometry is the last placement, not a visible target. \
+             Unminimize it before sending pointer input.",
+            window.title
+        );
+    }
+    Ok(())
+}
+
 fn lock_notes() -> (Option<bool>, String, Vec<String>) {
     let report = lockstate::detect();
     let mut notes = Vec::new();
@@ -1805,6 +1823,7 @@ fn tool_click_window(args: &Value) -> Result<String> {
             target.identifier
         );
     }
+    ensure_window_targetable(&target)?;
     let scene = Scene::from_windows(windows, true)?;
     let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &coordinates, x, y)?;
     let window = &scene.windows[index];
@@ -1865,6 +1884,7 @@ fn tool_move_window(args: &Value) -> Result<String> {
             target.identifier
         );
     }
+    ensure_window_targetable(&target)?;
     let scene = Scene::from_windows(windows, true)?;
     let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &coordinates, x, y)?;
     let window = &scene.windows[index];
@@ -1925,6 +1945,7 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
             target.identifier
         );
     }
+    ensure_window_targetable(&target)?;
     let scene = Scene::from_windows(windows, true)?;
     let (index, geometry, ox, oy, lx, ly) = window_point(&scene, &coordinates, x, y)?;
     let window = &scene.windows[index];
@@ -2414,6 +2435,24 @@ mod tests {
         let file_mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn pointer_input_rejects_windows_that_are_not_visible_targets() {
+        let inactive = Window {
+            title: "inactive".into(),
+            on_active_workspace: Some(false),
+            ..Window::default()
+        };
+        let minimized = Window {
+            title: "minimized".into(),
+            state: vec!["minimized".into()],
+            ..Window::default()
+        };
+
+        assert!(ensure_window_targetable(&inactive).is_err());
+        assert!(ensure_window_targetable(&minimized).is_err());
+        assert!(ensure_window_targetable(&Window::default()).is_ok());
     }
 
     #[test]
