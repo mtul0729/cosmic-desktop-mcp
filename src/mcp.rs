@@ -1407,6 +1407,23 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
 
     let base = existing_geometry.context("existing input geometry disappeared")?;
     let shot = capture::capture(base.output_index)?;
+    if shot.output.name != base.output_name
+        || (shot.width as i32, shot.height as i32) != (out.width, out.height)
+    {
+        bail!(
+            "the output topology changed while capturing {:?}; expected output #{} {} at {}x{}, \
+             but captured output #{} {} at {}x{}. Take a new screenshot_window",
+            window.title,
+            base.output_index,
+            base.output_name.as_deref().unwrap_or("<unnamed>"),
+            out.width,
+            out.height,
+            shot.output.index,
+            shot.output.name.as_deref().unwrap_or("<unnamed>"),
+            shot.width,
+            shot.height
+        );
+    }
     let geometry = WindowGeometry::new(
         base.region,
         base.output_index,
