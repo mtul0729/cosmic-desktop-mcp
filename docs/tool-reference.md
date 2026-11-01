@@ -123,7 +123,8 @@ Captures one window without opening the input session. The response includes:
 - `capture.source`: `window` for direct capture or `output_crop` for a composited crop
 - `capture.coordinate_safe`
 - `window`, `output`, `logical`, `pixels`, `workspaces`, `on_active_workspace`
-- `coordinates`: pass this object unchanged to the window pointer tools
+- `coordinates`: pass this object unchanged to the window pointer tools; it records the
+  output identity and size as well as the image, logical rect and crop origin
 
 Direct capture is preferred. It can show the target even when another window covers it, but
 COSMIC may omit server-side titlebars. If the direct frame does not cover the complete
@@ -200,9 +201,10 @@ start near the top when checking whether scrolling works.
 | `button` | string | `left` | `left`, `right` or `middle` |
 | `count` | integer | `1` | `1` for single-click, `2` for double-click |
 
-Validates that `coordinates` belongs to the selected window and that the screenshot is not
-stale, then converts the image point to output pixels and logical desktop coordinates.
-Do not reconstruct or edit the `coordinates` object.
+Validates that `coordinates` belongs to the selected window and that its output identity,
+size, crop origin and logical rect are still current, then converts the image point to
+output pixels and logical desktop coordinates. Do not reconstruct or edit the
+`coordinates` object.
 
 ### `move_window`
 

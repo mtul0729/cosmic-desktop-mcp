@@ -143,9 +143,10 @@ at logical size (verified: 2032x1104 for a window whose output-space crop is 254
 1.25 scale). The PNG is returned at that native size and is never resized.
 `capture.source` says which path ran (`window` or `output_crop`), `capture.native_size`
 records the direct source dimensions, and `capture.coordinate_safe` says whether it covers
-the whole logical window. `coordinates` carries the exact image size, logical rect and
-capture kind needed by the window input tools. `input_session_opened` is always `false` and
-`side_effects` is empty for this observation tool.
+the whole logical window. `coordinates` carries the output identity and size, exact image
+size, logical rect and capture kind needed by the window input tools.
+`input_session_opened` is always `false` and `side_effects` is empty for this observation
+tool.
 
 Direct capture can show the target's content even while another window covers it. The
 `output_crop` fallback shows the composited pixels actually visible in that rectangle.

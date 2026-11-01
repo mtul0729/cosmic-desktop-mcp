@@ -374,8 +374,8 @@ fn tool_definitions() -> Result<Vec<Tool>> {
             "name": "click_window",
             "description": "Click at (x,y) in the image returned by screenshot_window. Pass that \
     result's \"coordinates\" object unchanged: it identifies the screenshot's capture space, image \
-    size and logical window rect. The tool validates freshness, opens/reuses EIS, and resolves the \
-    output pixel and logical point itself.",
+    size, output identity and logical window rect. The tool validates freshness, opens/reuses EIS, \
+    and resolves the output pixel and logical point itself.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1294,6 +1294,11 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
             "capture": "window",
             "image": {"width": frame.width, "height": frame.height},
             "logical": logical,
+            "output": {
+                "index": output_index,
+                "name": window.output,
+                "size": {"width": out.width, "height": out.height},
+            },
             "origin": Value::Null,
         });
         let (locked, lock_evidence, mut notes) = lock_notes();
@@ -1424,6 +1429,11 @@ fn tool_screenshot_window(args: &Value) -> Result<ToolResponse> {
         "capture": "output_crop",
         "image": {"width": geometry.image.width, "height": geometry.image.height},
         "logical": geometry.logical,
+        "output": {
+            "index": geometry.output_index,
+            "name": geometry.output_name,
+            "size": {"width": out.width, "height": out.height},
+        },
         "origin": {"x": geometry.image.x, "y": geometry.image.y},
     });
     let (locked, lock_evidence, mut notes) = lock_notes();
@@ -1544,7 +1554,21 @@ struct WindowCoordinates {
     capture: WindowCaptureSpace,
     image: (u32, u32),
     logical: Rect,
+    output: WindowOutput,
     origin: Option<(i32, i32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct WindowOutput {
+    index: usize,
+    name: Option<String>,
+    size: WindowOutputSize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct WindowOutputSize {
+    width: i32,
+    height: i32,
 }
 
 fn window_coordinates_arg(args: &Value) -> Result<WindowCoordinates> {
@@ -1590,6 +1614,43 @@ fn window_coordinates_arg(args: &Value) -> Result<WindowCoordinates> {
     if logical.width <= 0 || logical.height <= 0 {
         bail!("coordinates.logical must have positive width and height");
     }
+    let output = coordinates
+        .get("output")
+        .and_then(Value::as_object)
+        .context("coordinates.output is missing")?;
+    let output_index = output
+        .get("index")
+        .and_then(Value::as_u64)
+        .context("coordinates.output.index is missing")?;
+    let output_index =
+        usize::try_from(output_index).context("coordinates.output.index is out of range")?;
+    let output_name = match output.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.clone()),
+        Some(other) => bail!(
+            "coordinates.output.name must be a string or null, got {}",
+            value_kind(other)
+        ),
+    };
+    let output_size = output
+        .get("size")
+        .and_then(Value::as_object)
+        .context("coordinates.output.size is missing")?;
+    let output_dimension = |name: &str| -> Result<i32> {
+        let value = output_size
+            .get(name)
+            .and_then(Value::as_i64)
+            .with_context(|| format!("coordinates.output.size.{name} is missing"))?;
+        i32::try_from(value)
+            .with_context(|| format!("coordinates.output.size.{name} is out of range"))
+    };
+    let output_size = WindowOutputSize {
+        width: output_dimension("width")?,
+        height: output_dimension("height")?,
+    };
+    if output_size.width <= 0 || output_size.height <= 0 {
+        bail!("coordinates.output.size must have positive width and height");
+    }
     let origin = coordinates
         .get("origin")
         .filter(|value| !value.is_null())
@@ -1616,6 +1677,11 @@ fn window_coordinates_arg(args: &Value) -> Result<WindowCoordinates> {
         capture,
         image: (width, height),
         logical,
+        output: WindowOutput {
+            index: output_index,
+            name: output_name,
+            size: output_size,
+        },
         origin,
     })
 }
@@ -1657,6 +1723,28 @@ fn window_point(
         );
     }
     let geometry = scene.geometry(index)?.clone();
+    let out = scene.output(geometry.output_index)?;
+    if coordinates.output.index != geometry.output_index
+        || coordinates.output.name != geometry.output_name
+        || coordinates.output.size
+            != (WindowOutputSize {
+                width: out.width,
+                height: out.height,
+            })
+    {
+        bail!(
+            "the screenshot is stale: it was taken on output #{} {} at {}x{}, but the window is \
+             now on output #{} {} at {}x{}; take a new screenshot_window",
+            coordinates.output.index,
+            coordinates.output.name.as_deref().unwrap_or("<unnamed>"),
+            coordinates.output.size.width,
+            coordinates.output.size.height,
+            geometry.output_index,
+            geometry.output_name.as_deref().unwrap_or("<unnamed>"),
+            out.width,
+            out.height
+        );
+    }
     let (ox, oy, lx, ly) = match coordinates.capture {
         WindowCaptureSpace::Window => {
             if !coords::direct_frame_covers_logical(
@@ -1884,6 +1972,7 @@ fn tool_click_window(args: &Value) -> Result<String> {
             },
             "image": {"width": coordinates.image.0, "height": coordinates.image.1},
             "logical": coordinates.logical,
+            "output": coordinates.output,
             "origin": coordinates.origin.map(|(x, y)| json!({"x": x, "y": y})).unwrap_or(Value::Null),
         },
         "point": {
@@ -1946,6 +2035,7 @@ fn tool_move_window(args: &Value) -> Result<String> {
             },
             "image": {"width": coordinates.image.0, "height": coordinates.image.1},
             "logical": coordinates.logical,
+            "output": coordinates.output,
             "origin": coordinates.origin.map(|(x, y)| json!({"x": x, "y": y})).unwrap_or(Value::Null),
         },
         "point": {
@@ -2012,6 +2102,7 @@ fn tool_scroll_window(args: &Value) -> Result<String> {
             },
             "image": {"width": coordinates.image.0, "height": coordinates.image.1},
             "logical": coordinates.logical,
+            "output": coordinates.output,
             "origin": coordinates.origin.map(|(x, y)| json!({"x": x, "y": y})).unwrap_or(Value::Null),
         },
         "point": {
@@ -2527,6 +2618,11 @@ mod tests {
                 "capture": "window",
                 "image": {"width": 1280, "height": 720},
                 "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
                 "origin": null
             }
         }))
@@ -2534,6 +2630,16 @@ mod tests {
         assert_eq!(direct.window, "abc");
         assert_eq!(direct.capture, WindowCaptureSpace::Window);
         assert_eq!(direct.image, (1280, 720));
+        assert_eq!(direct.output.index, 0);
+        assert_eq!(direct.output.name.as_deref(), Some("eDP-1"));
+        assert_eq!(
+            serde_json::to_value(&direct.output).unwrap(),
+            json!({
+                "index": 0,
+                "name": "eDP-1",
+                "size": {"width": 1920, "height": 1080}
+            })
+        );
         assert_eq!(direct.origin, None);
 
         let crop = window_coordinates_arg(&json!({
@@ -2542,6 +2648,11 @@ mod tests {
                 "capture": "output_crop",
                 "image": {"width": 960, "height": 540},
                 "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
                 "origin": {"x": 15, "y": 30}
             }
         }))
@@ -2552,12 +2663,33 @@ mod tests {
 
     #[test]
     fn window_coordinates_reject_incomplete_or_ambiguous_shapes() {
+        let missing_output = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "abc",
+                "capture": "window",
+                "image": {"width": 1280, "height": 720},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "origin": null
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            missing_output.contains("coordinates.output is missing"),
+            "{missing_output}"
+        );
+
         let missing_origin = window_coordinates_arg(&json!({
             "coordinates": {
                 "window": "abc",
                 "capture": "output_crop",
                 "image": {"width": 960, "height": 540},
-                "logical": {"x": 10, "y": 20, "width": 640, "height": 360}
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                }
             }
         }))
         .unwrap_err()
@@ -2573,6 +2705,11 @@ mod tests {
                 "capture": "output_crop",
                 "image": {"width": 960, "height": 540},
                 "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
                 "origin": {"x": 15}
             }
         }))
@@ -2588,7 +2725,12 @@ mod tests {
                 "window": "abc",
                 "capture": "surface",
                 "image": {"width": 960, "height": 540},
-                "logical": {"x": 10, "y": 20, "width": 640, "height": 360}
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                }
             }
         }))
         .unwrap_err()
@@ -2651,6 +2793,11 @@ mod tests {
                 "capture": "window",
                 "image": {"width": 1280, "height": 720},
                 "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
                 "origin": null
             }
         }))
@@ -2669,6 +2816,11 @@ mod tests {
                 "capture": "window",
                 "image": {"width": 1280, "height": 696},
                 "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
                 "origin": null
             }
         }))
@@ -2688,6 +2840,11 @@ mod tests {
                 "capture": "output_crop",
                 "image": {"width": 960, "height": 540},
                 "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 0,
+                    "name": "eDP-1",
+                    "size": {"width": 1920, "height": 1080}
+                },
                 "origin": {"x": 99, "y": 30}
             }
         }))
@@ -2696,5 +2853,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("screenshot is stale"), "{err}");
+    }
+
+    #[test]
+    fn window_points_reject_coordinates_from_another_output() {
+        let scene = coordinate_scene();
+        let coordinates = window_coordinates_arg(&json!({
+            "coordinates": {
+                "window": "window-id",
+                "capture": "output_crop",
+                "image": {"width": 960, "height": 540},
+                "logical": {"x": 10, "y": 20, "width": 640, "height": 360},
+                "output": {
+                    "index": 1,
+                    "name": "DP-2",
+                    "size": {"width": 2560, "height": 1440}
+                },
+                "origin": {"x": 15, "y": 30}
+            }
+        }))
+        .unwrap();
+        let err = window_point(&scene, &coordinates, 10, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("different output") || err.contains("screenshot is stale"),
+            "{err}"
+        );
     }
 }

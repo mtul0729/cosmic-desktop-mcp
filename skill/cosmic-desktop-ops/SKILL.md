@@ -112,6 +112,11 @@ screenshot_window {window: "kitty"}
       "capture": "output_crop",
       "image": {"width": 942, "height": 1008},
       "logical": {"x": 644, "y": 40, "width": 628, "height": 672},
+      "output": {
+        "index": 1,
+        "name": "eDP-1",
+        "size": {"width": 1920, "height": 1080}
+      },
       "origin": {"x": 966, "y": 60}
     },
     "output":  {"index": 1, "name": "eDP-1", "scale": 1.5},
