@@ -31,8 +31,8 @@ use crate::wl;
 use crate::wl::toplevel::{self, Rect, Window};
 use crate::wl::{capture, workspace};
 
-const INPUT_VERIFICATION_NOTE: &str = "EIS accepted the input request, but the compositor does not \
-acknowledge delivery; take a new screenshot to verify the result.";
+const INPUT_VERIFICATION_NOTE: &str = "The input request was flushed to EIS, but the compositor \
+does not acknowledge delivery; take a new screenshot to verify the result.";
 
 pub fn serve() -> Result<()> {
     let result = tokio::runtime::Builder::new_multi_thread()

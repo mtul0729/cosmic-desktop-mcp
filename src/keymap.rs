@@ -41,8 +41,7 @@ impl Button {
     }
 }
 
-/// US layout: the compositor's own layout is irrelevant here because the events
-/// go in below it.
+/// US-layout keycodes; the compositor applies its current layout to these events.
 pub fn keycode_for(ch: char) -> Option<(u16, bool)> {
     let (code, shift) = match ch {
         'a'..='z' => (letter(ch)?, false),

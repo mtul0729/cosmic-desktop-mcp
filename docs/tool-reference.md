@@ -82,7 +82,7 @@ output metadata, and `screen_locked` (`null` when logind cannot answer). The ima
 the output's full screenshot resolution. It is the pixel space accepted by `click`, `move`
 and `scroll` with the same `output`. PNGs are written to a private `0700` directory with
 mode `0600`; screenshot tools fail rather than use a shared temporary directory.
-`XDG_RUNTIME_DIR` must be absolute and refer to an existing directory.
+When set, `XDG_RUNTIME_DIR` must be absolute and refer to an existing directory.
 
 If `screen_locked` is `true`, the image is the lock screen or a blanked desktop, not the
 user's session. Capture can also time out while locked.
