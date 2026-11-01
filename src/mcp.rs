@@ -889,11 +889,31 @@ fn tool_config_write(args: &Value) -> Result<String> {
 }
 
 /// Returns the index of the output with connector `name`, if still present.
+///
+/// Callers must reject duplicate connector names first; otherwise the first
+/// match would be an arbitrary choice.
 fn output_index_for(name: &str, outputs: &[capture::OutputInfo]) -> Option<usize> {
     outputs
         .iter()
         .find(|out| out.name.as_deref() == Some(name))
         .map(|out| out.index)
+}
+
+fn ensure_unique_output_names(outputs: &[capture::OutputInfo]) -> Result<()> {
+    let mut seen = std::collections::HashMap::new();
+    for out in outputs {
+        let Some(name) = out.name.as_deref() else {
+            continue;
+        };
+        if let Some(first) = seen.insert(name, out.index) {
+            bail!(
+                "outputs #{first} and #{} both report connector name {name:?}; cannot map a \
+                 window to an output without guessing",
+                out.index
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Everything a pointer tool needs at one instant: windows, outputs, EIS
@@ -926,6 +946,7 @@ impl Scene {
         outputs: Vec<capture::OutputInfo>,
         open_session: bool,
     ) -> Result<Self> {
+        ensure_unique_output_names(&outputs)?;
         let regions = if open_session {
             crate::eis::session()?.regions()
         } else {
@@ -2758,6 +2779,31 @@ mod tests {
         .unwrap();
         assert_eq!(crop.capture, WindowCaptureSpace::OutputCrop);
         assert_eq!(crop.origin, Some((15, 30)));
+    }
+
+    #[test]
+    fn duplicate_output_connector_names_are_rejected_before_mapping_windows() {
+        let outputs = vec![
+            capture::OutputInfo {
+                index: 0,
+                name: Some("DP-1".into()),
+                width: 1920,
+                height: 1080,
+                scale: 1,
+            },
+            capture::OutputInfo {
+                index: 1,
+                name: Some("DP-1".into()),
+                width: 2560,
+                height: 1440,
+                scale: 2,
+            },
+        ];
+
+        let err = ensure_unique_output_names(&outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both report connector name"), "{err}");
     }
 
     #[test]
